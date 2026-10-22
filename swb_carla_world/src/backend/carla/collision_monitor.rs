@@ -264,6 +264,18 @@ fn describe(id: Option<u32>, name: Option<&str>, other_type: &str) -> String {
 
 /// The monitor as the coordinator holds it: the sensor, the frame counter the callback
 /// reads, and the queue between the callback and the coordinator's thread.
+/// One tracking record of one frame (what [`TrackingStats`] counts).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TrackingSample {
+    Measured {
+        error: f64,
+        yaw_error: Option<f64>,
+        snapped: bool,
+    },
+    Missed,
+    Fallback,
+}
+
 pub struct CollisionMonitor {
     enabled: bool,
     /// SSv2 `UpdateFrame` count since `Initialize`. Shared with the sensor callback.
@@ -282,6 +294,9 @@ pub struct CollisionMonitor {
     geometry: Vec<ReportGeometry>,
     /// Each tracked NPC's tracking error, this episode (roadmap 023).
     tracking: std::collections::BTreeMap<String, TrackingStats>,
+    /// This frame's tracking records, for the world protocol (roadmap 046), drained by
+    /// [`CollisionMonitor::take_tracking_samples`].
+    samples: Vec<(String, TrackingSample)>,
     /// The SSv2 frame of each actor's latest contact with the ego, this episode.
     last_contact: std::collections::HashMap<u32, u64>,
     /// Every drained event with the other actor's SSv2 name, kept for the gap trace
@@ -323,6 +338,7 @@ impl CollisionMonitor {
             run_start_unix: 0.0,
             geometry: Vec::new(),
             tracking: Default::default(),
+            samples: Vec::new(),
             last_contact: Default::default(),
             traced: None,
             npc_sensors_enabled: false,
@@ -425,6 +441,14 @@ impl CollisionMonitor {
             .entry(name.to_string())
             .or_default()
             .record(error, yaw_error, snapped);
+        self.samples.push((
+            name.to_string(),
+            TrackingSample::Measured {
+                error,
+                yaw_error,
+                snapped,
+            },
+        ));
     }
 
     /// A tracked NPC skipped this frame: it was not in the world snapshot.
@@ -433,6 +457,8 @@ impl CollisionMonitor {
             .entry(name.to_string())
             .or_default()
             .record_missed();
+        self.samples
+            .push((name.to_string(), TrackingSample::Missed));
     }
 
     /// A tracked NPC driven kinematic this frame after a blocked fallback (roadmap 032).
@@ -441,6 +467,13 @@ impl CollisionMonitor {
             .entry(name.to_string())
             .or_default()
             .record_fallback();
+        self.samples
+            .push((name.to_string(), TrackingSample::Fallback));
+    }
+
+    /// The tracking records since the last call, in order.
+    pub fn take_tracking_samples(&mut self) -> Vec<(String, TrackingSample)> {
+        std::mem::take(&mut self.samples)
     }
 
     fn tracking_rows(&self) -> Vec<ReportTracking> {

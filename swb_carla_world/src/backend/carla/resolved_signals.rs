@@ -4,7 +4,7 @@
 //!
 //! This bridge already resolves which CARLA light is which Lanelet2 signal (the explicit
 //! `config/traffic_lights_<town>.yaml` merged with the position match). At Initialize it
-//! checks that result against the map artifact `<map dir>/carla/traffic_lights.yaml`:
+//! checks that result against the map artifact `<map dir>/traffic_lights.yaml`:
 //!
 //! ```yaml
 //! town: Town01
@@ -21,7 +21,8 @@
 //!
 //! Since roadmap 017 the table is a **map artifact**, generated once per map with
 //! `carla_scenario_bridge --generate-signal-table <map dir>` into
-//! `<map dir>/carla/traffic_lights.yaml` (CARLA-specific, so in the map dir's `carla/`).
+//! `<map dir>/traffic_lights.yaml` (roadmap 046: one table every simulator with signals
+//! reads; `carla/traffic_lights.yaml` before, still read and kept as a link to it).
 //! At Initialize csb resolves the mapping again and **checks** it against that file instead
 //! of writing into the map directory: the map dir is the user's, read-only at run time.
 //! A difference fails Initialize, because acb would publish signals for the wrong lights.
@@ -35,7 +36,7 @@ use super::traffic_light_mapper::{CarlaSignal, SignalMap};
 use crate::lanelet_map::TrafficLightElement;
 
 /// Where the table lives, relative to the map directory.
-pub const TABLE_SUBPATH: &str = "carla/traffic_lights.yaml";
+pub const TABLE_SUBPATH: &str = crate::map_resolver::SIGNAL_TABLE_SUBPATH;
 
 #[derive(Debug, Serialize, PartialEq)]
 pub struct ResolvedSignal {
@@ -137,14 +138,30 @@ impl ResolvedTable {
 
 pub use crate::map_resolver::map_dir_of;
 
+/// The table to check: `<map dir>/traffic_lights.yaml`, or the older
+/// `<map dir>/carla/traffic_lights.yaml` when only that exists.
 pub fn table_path(map_dir: &Path) -> PathBuf {
-    map_dir.join(TABLE_SUBPATH)
+    crate::map_resolver::signal_table(map_dir)
 }
 
-/// Write the table into `map_dir/carla/` atomically (acb re-reads it on change and must
-/// never see half of it). Only the generator writes; Initialize checks.
+/// Write the table into `map_dir` atomically (acb re-reads it on change and must never see
+/// half of it), and point the older `carla/traffic_lights.yaml` at it, for a vehicle bridge
+/// still configured with that path. Only the generator writes; Initialize checks.
 pub fn write_table(map_dir: &Path, contents: &str) -> Result<PathBuf> {
-    let path = table_path(map_dir);
+    let path = map_dir.join(TABLE_SUBPATH);
+    let written = write_atomically(&path, contents)?;
+    let old = map_dir.join(crate::map_resolver::OLD_SIGNAL_TABLE_SUBPATH);
+    if let Some(dir) = old.parent() {
+        std::fs::create_dir_all(dir).wrap_err_with(|| format!("create {}", dir.display()))?;
+    }
+    let _ = std::fs::remove_file(&old);
+    std::os::unix::fs::symlink(Path::new("..").join(TABLE_SUBPATH), &old)
+        .wrap_err_with(|| format!("link {}", old.display()))?;
+    Ok(written)
+}
+
+fn write_atomically(path: &Path, contents: &str) -> Result<PathBuf> {
+    let path = path.to_path_buf();
     let dir = path.parent().expect("TABLE_SUBPATH has a parent");
     std::fs::create_dir_all(dir).wrap_err_with(|| format!("create {}", dir.display()))?;
     let tmp = dir.join(format!(".traffic_lights.yaml.{}.tmp", std::process::id()));
@@ -291,8 +308,15 @@ mod tests {
         assert_eq!(check_table(&path, &table()).unwrap(), Check::Missing);
 
         let written = write_table(&base, &table().to_yaml().unwrap()).unwrap();
-        assert_eq!(written, base.join("carla/traffic_lights.yaml"));
+        assert_eq!(written, base.join("traffic_lights.yaml"));
         assert_eq!(check_table(&path, &table()).unwrap(), Check::Matches);
+        // The older path still reads the table (a link to it), for acb's default.
+        let old = base.join("carla/traffic_lights.yaml");
+        assert_eq!(
+            std::fs::read_to_string(&old).unwrap(),
+            std::fs::read_to_string(&written).unwrap()
+        );
+        assert_eq!(table_path(&base), written);
 
         // The map path is spelled differently where it is mounted; that is not a change.
         let mut moved = table();

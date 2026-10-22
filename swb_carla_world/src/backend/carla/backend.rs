@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use super::traffic_light_mapper::{carla_state_for_signal, signal_uses_arrows, SignalMap};
-use crate::agent_link::{self, AgentLink, AgentPose, Command as AgentCommand};
+use crate::agent_link::{self, AgentLink, AgentPose};
 use crate::autopilot;
 use crate::blueprint_boxes::{self, BoxTable, Dimensions, SizeClass};
 use crate::body_clearance::{self, BodyBox};
@@ -461,8 +461,8 @@ use crate::proto::traffic_simulator_msgs::entity_subtype::Enum as EntitySubtype;
 use crate::proto::traffic_simulator_msgs::{self, BoundingBox};
 use crate::sensor_release::SensorReleaseNotifier;
 use crate::spawn_ladder;
+use crate::weather::WeatherReply;
 use crate::weather::{Weather, WeatherRequest};
-use crate::world_services::WeatherReply;
 
 /// `(elapsed_seconds, delta_seconds)` of `world`'s current snapshot.
 /// Why a watched tick failed (roadmap 032 N5).
@@ -1129,7 +1129,7 @@ pub struct CarlaBackend {
     world_id: Option<u64>,
     /// Where the episode clock is recorded for the next csb process (clock_store).
     clock_path: PathBuf,
-    /// Generator mode: write `<map dir>/carla/traffic_lights.yaml` instead of checking it.
+    /// Generator mode: write `<map dir>/traffic_lights.yaml` instead of checking it.
     generate_signal_table: bool,
     /// Map-frame position of CARLA's world origin for the scenario's map, read at every
     /// Initialize from `<map dir>/carla/map_origin.yaml` (zero without one).
@@ -1181,8 +1181,33 @@ pub struct CarlaBackend {
     /// warns once per blueprint rather than once per spawn.
     warned_stale_boxes: HashSet<String>,
     /// The per-frame record of both worlds for the oracle (roadmap 024); records nothing
-    /// unless `gap_trace_dir` is set. See `gap_trace`.
+    /// unless `gap_trace_dir` is set. See `gap_trace`. Off in the world server: the bridge
+    /// writes the trace from what the world protocol carries (roadmap 046).
     gap_trace: GapTrace,
+    /// The body the last spawn chose, for the world protocol's `SpawnReply`.
+    last_spawn_body: Option<SpawnBody>,
+    /// The snapshot [`CarlaBackend::actor_states`] read after the last tick, for the next
+    /// [`CarlaBackend::fresh_snapshot`] of the same tick.
+    post_tick_snapshot: Option<carla::client::WorldSnapshot>,
+}
+
+/// What a spawn chose for an entity: the gap trace `entity` record's CARLA half.
+#[derive(Debug, Clone)]
+pub struct SpawnBody {
+    pub actor_id: u32,
+    pub blueprint: String,
+    pub blueprint_box: Option<gap_trace::BlueprintBox>,
+    /// `[x, y, yaw]`, the `OriginOffset`.
+    pub origin_offset: [f64; 3],
+    pub declared_center: [f64; 3],
+    pub declared_dimensions: [f64; 3],
+}
+
+/// One tracked entity's state this frame, for the world protocol's `TrackingSample`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TrackingFlags {
+    pub held: bool,
+    pub kinematic: bool,
 }
 
 impl CarlaBackend {
@@ -1230,9 +1255,8 @@ impl CarlaBackend {
         let gap_trace = GapTrace::new(config.gap_trace_dir());
         let mut collision_monitor =
             CollisionMonitor::new(collision_monitor_enabled, contact_report_dir);
-        if gap_trace.is_on() {
-            collision_monitor.keep_for_trace();
-        }
+        // Contacts are kept for the world protocol's replies, trace or not (roadmap 046).
+        collision_monitor.keep_for_trace();
         collision_monitor.set_npc_sensors(config.npc_contact_sensors_enabled());
         Self {
             map_aliases: config.map_alias.clone(),
@@ -1318,6 +1342,130 @@ impl CarlaBackend {
             blueprint_boxes,
             warned_stale_boxes: HashSet::new(),
             gap_trace,
+            last_spawn_body: None,
+            post_tick_snapshot: None,
+        }
+    }
+
+    // --- The world protocol's hooks (roadmap 046) ------------------------------------------
+
+    /// The body the last successful spawn chose.
+    pub fn take_spawn_body(&mut self) -> Option<SpawnBody> {
+        self.last_spawn_body.take()
+    }
+
+    /// The contacts the collision sensors reported since the last call: each with the SSv2
+    /// name of the entity whose sensor saw it (`None`: the ego's) and the other's name.
+    pub fn take_contacts(&mut self) -> Vec<(crate::contact_report::RawCollision, Option<String>)> {
+        self.drain_collisions();
+        self.collision_monitor.take_traced()
+    }
+
+    /// Tracking samples recorded since the last call, by entity name.
+    pub fn take_tracking_samples(
+        &mut self,
+    ) -> Vec<(String, super::collision_monitor::TrackingSample)> {
+        self.collision_monitor.take_tracking_samples()
+    }
+
+    /// The tracked entity `name`'s flags this frame, as the gap trace reads them: held (an ego
+    /// contact, or another body within the proximity hold) and handed to kinematic.
+    pub fn tracking_flags(&self, name: &str) -> Option<TrackingFlags> {
+        let actor_id = self.entities.get(name)?.carla_actor_id;
+        let npc = self.tracked_npcs.get(&actor_id);
+        let kinematic = self.kinematic_fallback.contains(&actor_id);
+        if npc.is_none() && !kinematic {
+            return None;
+        }
+        Some(TrackingFlags {
+            held: npc.is_some_and(|n| {
+                n.held
+                    || self
+                        .collision_monitor
+                        .touched_within(actor_id, npc_tracking::CONTACT_HOLD_FRAMES)
+            }),
+            kinematic,
+        })
+    }
+
+    /// The town a map directory means, when its `carla/world.yaml` names one: as a
+    /// `map_alias` entry, which the map resolver consults first.
+    pub fn alias_town(&mut self, map_dir_name: &str, town: &str) {
+        self.map_aliases
+            .insert(map_dir_name.to_string(), town.to_string());
+    }
+
+    /// The configured ego role name.
+    pub fn ego_role_name(&self) -> &str {
+        &self.config.ego.role_name
+    }
+
+    /// How SSv2-driven NPCs spawned from now on move: the bridge asks per entity.
+    pub fn set_npc_motion(&mut self, motion: NpcMotion) {
+        self.config.npc_motion = motion;
+    }
+
+    /// Every entity's actor after the last tick, from one world snapshot: its transform in
+    /// the map frame as `[x, y, z, roll, pitch, yaw]` (ROS, the actor origin) and its
+    /// velocity, by SSv2 name. Empty when no snapshot can be read.
+    pub fn actor_states(&mut self) -> Vec<(String, gap_trace::Pose6, [f64; 3])> {
+        let snapshot = match self.fresh_snapshot() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!("No world snapshot for the states ({e})");
+                return Vec::new();
+            }
+        };
+        let map_origin = self.map_origin;
+        let states = self
+            .entities
+            .names()
+            .filter_map(|name| {
+                let id = self.entities.get(&name)?.carla_actor_id;
+                let actor = snapshot.find(id)?;
+                let (pose, velocity) = carla_trace_state(&actor, map_origin);
+                Some((name, pose, velocity))
+            })
+            .collect();
+        self.post_tick_snapshot = Some(snapshot);
+        states
+    }
+
+    /// The CARLA frame of the last tick, when there was one in this world.
+    pub fn last_tick_frame(&self) -> Option<u64> {
+        self.last_tick_frame
+    }
+
+    /// The map origin this backend applies (`<map dir>/carla/map_origin.yaml`).
+    pub fn map_origin(&self) -> [f64; 3] {
+        [self.map_origin.x, self.map_origin.y, self.map_origin.z]
+    }
+
+    /// Lamp states by OpenDRIVE signal id (the world protocol's `SetSignals`): written to
+    /// CARLA's lights and kept, so they can be put back after the Traffic Manager resets them.
+    pub fn set_signal_states(
+        &mut self,
+        states: &[(String, carla::rpc::TrafficLightState)],
+    ) -> std::result::Result<(), BackendError> {
+        let mut failures = Vec::new();
+        for (opendrive_id, state) in states {
+            match self.set_signal_state(opendrive_id, state.clone()) {
+                Ok(()) => {
+                    self.commanded_lights
+                        .insert(opendrive_id.clone(), state.clone());
+                }
+                Err(e) => failures.push(format!("{opendrive_id}: {e}")),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            failed(format!(
+                "Failed to apply {} of {} traffic light state(s): {}",
+                failures.len(),
+                states.len(),
+                failures.join("; ")
+            ))
         }
     }
 
@@ -1329,7 +1477,7 @@ impl CarlaBackend {
         let Some((label, w)) = self.requested_weather.clone() else {
             return;
         };
-        match self.world.set_weather(&w.to_carla()) {
+        match self.world.set_weather(&super::weather::to_carla(w)) {
             Ok(()) => tracing::info!("Weather {label} applied ({why})"),
             Err(e) => tracing::warn!("Could not apply weather {label} ({why}): {e}"),
         }
@@ -1339,7 +1487,7 @@ impl CarlaBackend {
     pub fn weather(&self) -> Result<Weather> {
         self.world
             .weather()
-            .map(|w| Weather::from(&w))
+            .map(|w| super::weather::from_carla(&w))
             .map_err(|e| eyre::eyre!("get weather: {e}"))
     }
 
@@ -1355,7 +1503,7 @@ impl CarlaBackend {
             },
         };
         self.requested_weather = Some((label.clone(), w));
-        if let Err(e) = self.world.set_weather(&w.to_carla()) {
+        if let Err(e) = self.world.set_weather(&super::weather::to_carla(w)) {
             return WeatherReply::failed(
                 format!("set weather {label}: {e}; kept, and applied on the next connect"),
                 None,
@@ -2243,7 +2391,7 @@ impl CarlaBackend {
         self.check_resolved_signals(town, lanelet2_map_path, &lanelet_lights, &carla_signals)
     }
 
-    /// Compare the resolved table with `<map dir>/carla/traffic_lights.yaml`, the map
+    /// Compare the resolved table with `<map dir>/traffic_lights.yaml`, the map
     /// artifact acb publishes signals from (roadmap 017: the map dir is read-only at run
     /// time). In generator mode (`generate_signal_table`) write it instead.
     ///
@@ -2734,7 +2882,7 @@ impl CarlaBackend {
     }
 
     /// `--generate-signal-table <map dir>`: load the map's town in CARLA, resolve its signals
-    /// and write `<map dir>/carla/traffic_lights.yaml`. The one place csb writes a map dir.
+    /// and write `<map dir>/traffic_lights.yaml`. The one place csb writes a map dir.
     pub fn generate_signal_table(&mut self, map_dir: &std::path::Path) -> Result<()> {
         self.generate_signal_table = true;
         let result = self.load_scenario_map(&map_dir.to_string_lossy());
@@ -4044,6 +4192,16 @@ impl CarlaBackend {
             }
         }
 
+        self.last_spawn_body = Some(SpawnBody {
+            actor_id,
+            blueprint: blueprint_key.clone(),
+            blueprint_box: trace_box.clone(),
+            origin_offset: [origin_offset.x, origin_offset.y, origin_offset.yaw],
+            declared_center: shape.center,
+            declared_dimensions: shape
+                .declared
+                .map_or([0.0; 3], |d| [d.length, d.width, d.height]),
+        });
         // Everything SSv2 spawns is registered (SpawnKind::entity_type).
         if let Some(entity_type) = kind.entity_type() {
             self.entities
@@ -4206,22 +4364,12 @@ impl CarlaBackend {
             // Whether an agent is registered yet does not matter here: the vehicle side
             // may come up later. The agent is told where its vehicle is as soon as it is
             // there; a goal for an entity with no agent is what fails (UpdateEntityGoal).
+            // Its agent is told where it is by the bridge (roadmap 046: the agent link is
+            // the bridge's); this server keeps the vehicle and its ledger.
             self.agent_vehicles.insert(name.clone());
             self.store_agent_ledger();
-            let pose = req.pose.as_ref().map(agent_pose);
-            let link = self.agent_link();
-            if let Some(pose) = pose {
-                link.spawned(&name, pose);
-            }
         }
         Ok(())
-    }
-
-    /// The agent link, started on first use.
-    fn agent_link(&mut self) -> &mut AgentLink {
-        let relay = self.config.agent_relay().to_string();
-        self.agent_link
-            .get_or_insert_with(|| AgentLink::start(&relay))
     }
 
     /// An `agent` entity's role_name is its name; refuse one another vehicle already has,
@@ -5045,9 +5193,10 @@ impl CarlaBackend {
     pub fn update_entity_goal(&mut self, name: &str, req: &Goal) -> Result<(), BackendError> {
         let name = name.to_string();
         if self.agent_vehicles.contains(&name) {
-            return self
-                .update_agent_goal(&name, req)
-                .or_else(|e| failed(format!("UpdateEntityGoal for '{name}': {e:#}")));
+            return failed(format!(
+                "UpdateEntityGoal for '{name}': an agent vehicle's goal goes to its agent, \
+                 through the bridge"
+            ));
         }
         let Some(mut ap) = self.autopilot.remove(&name) else {
             let why = if self.entities.get(&name).is_some() {
@@ -5065,39 +5214,6 @@ impl CarlaBackend {
         let outcome = self.update_autopilot_goal(&name, &mut ap, req);
         self.autopilot.insert(name.clone(), ap);
         outcome.or_else(|e| failed(format!("UpdateEntityGoal for '{name}': {e:#}")))
-    }
-
-    /// An `agent` entity's goal, route or target speed goes to its agent (queued; sent once
-    /// SSv2's NPC logic runs and the agent can take it). Fails at once, naming the entity,
-    /// when no agent is registered for it -- SSv2 then ends the scenario.
-    fn update_agent_goal(&mut self, name: &str, req: &Goal) -> Result<()> {
-        let target_speed = match req.target_speed {
-            Some(v) if !(v.is_finite() && v >= 0.0) => {
-                eyre::bail!("target speed {v} m/s is not a speed");
-            }
-            v => v,
-        };
-        let waypoints: Vec<AgentPose> = req.waypoints.iter().map(agent_pose).collect();
-        let commands = AgentCommand::from_goal_request(&waypoints, req.clear, target_speed);
-        if commands.is_empty() {
-            return Ok(());
-        }
-        self.agent_link()
-            .check_agent(name)
-            .map_err(|e| eyre::eyre!("{e:#}"))?;
-        for command in &commands {
-            match command {
-                AgentCommand::SetGoal { goal, waypoints } => tracing::info!(
-                    "'{name}': goal ({:.1}, {:.1}) via {} waypoint(s) for its agent",
-                    goal.x,
-                    goal.y,
-                    waypoints.len()
-                ),
-                other => tracing::info!("'{name}': {} for its agent", other.name()),
-            }
-        }
-        self.agent_link().push(name, commands);
-        Ok(())
     }
 
     fn update_autopilot_goal(
@@ -5745,6 +5861,13 @@ impl CarlaBackend {
     /// Past the bound the stale copy is returned with a warning; a missing actor in it is
     /// the caller's to absorb.
     fn fresh_snapshot(&mut self) -> Result<carla::client::WorldSnapshot> {
+        // The one read after the last tick for the world protocol's states, when it is of that
+        // tick: one snapshot per frame, shared with the tracked path, as before the split.
+        if let Some(s) = self.post_tick_snapshot.take() {
+            if Some(s.frame() as u64) == self.last_tick_frame {
+                return Ok(s);
+            }
+        }
         let started = Instant::now();
         let world = &self.world;
         let read = npc_tracking::read_fresh(
@@ -6173,7 +6296,7 @@ impl SimBackend for CarlaBackend {
         CarlaBackend::attach_sensor(self, sensor)
     }
 
-    fn get_weather(&self) -> WeatherReply {
+    fn get_weather(&mut self) -> WeatherReply {
         CarlaBackend::get_weather(self)
     }
 

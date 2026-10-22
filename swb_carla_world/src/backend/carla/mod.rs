@@ -1,4 +1,4 @@
-//! CARLA as csb's simulator: [`CarlaBackend`], through carla-rust (roadmap 035).
+//! CARLA as a world: [`CarlaBackend`], through carla-rust (roadmaps 035, 046).
 //!
 //! Everything that knows CARLA lives under this module -- its left-handed frame, actor ids,
 //! blueprints, towns, synchronous mode and the Traffic Manager, the lights and their table
@@ -47,46 +47,39 @@ fn connect_to_carla(host: &str, port: u16, shutdown: &AtomicBool) -> Option<Clie
         if shutdown.load(Ordering::SeqCst) {
             return None;
         }
-
-        match Client::connect(host, port, None) {
-            Ok(mut client) => {
-                if let Err(e) = client.set_timeout(Duration::from_secs(30)) {
-                    tracing::warn!("Failed to set timeout: {e}, retrying in 5s...");
-                    std::thread::sleep(Duration::from_secs(5));
-                    continue;
-                }
-                // A server of another CARLA release is refused like an unreachable one.
-                match version::verify(&client) {
-                    Ok(server) => tracing::info!(
-                        "CARLA server version {server} matches this build ({})",
-                        version::BUILT_FOR
-                    ),
-                    Err(e) => {
-                        tracing::error!("Refusing CARLA at {host}:{port}: {e}; retrying in 5s...");
-                        std::thread::sleep(Duration::from_secs(5));
-                        continue;
-                    }
-                }
-                match client.world() {
-                    // A starting CARLA serves RPC before its first map is loaded (empty map
-                    // name); anything sent to it then can wedge it. Wait for the map.
-                    Ok(world) if world.map().map(|m| m.name()).unwrap_or_default().is_empty() => {
-                        tracing::warn!("CARLA is still loading its first map, retrying in 5s...");
-                    }
-                    Ok(_) => {
-                        tracing::info!("Connected to CARLA at {host}:{port}");
-                        return Some(client);
-                    }
-                    Err(e) => {
-                        tracing::warn!("CARLA not ready: {e}, retrying in 5s...");
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("CARLA connection failed: {e}, retrying in 5s...");
-            }
+        match connect_once(host, port) {
+            Ok(client) => return Some(client),
+            Err(e) => tracing::warn!("{e}; retrying in 5s..."),
         }
-
         std::thread::sleep(Duration::from_secs(5));
+    }
+}
+
+/// One attempt to reach CARLA: a client with this build's version on a server with a
+/// loaded map, or why not.
+pub fn connect_once(host: &str, port: u16) -> Result<Client, String> {
+    let mut client =
+        Client::connect(host, port, None).map_err(|e| format!("CARLA connection failed: {e}"))?;
+    client
+        .set_timeout(Duration::from_secs(30))
+        .map_err(|e| format!("Failed to set timeout: {e}"))?;
+    // A server of another CARLA release is refused like an unreachable one.
+    let server =
+        version::verify(&client).map_err(|e| format!("Refusing CARLA at {host}:{port}: {e}"))?;
+    tracing::info!(
+        "CARLA server version {server} matches this build ({})",
+        version::BUILT_FOR
+    );
+    match client.world() {
+        // A starting CARLA serves RPC before its first map is loaded (empty map name);
+        // anything sent to it then can wedge it. Wait for the map.
+        Ok(world) if world.map().map(|m| m.name()).unwrap_or_default().is_empty() => {
+            Err("CARLA is still loading its first map".into())
+        }
+        Ok(_) => {
+            tracing::info!("Connected to CARLA at {host}:{port}");
+            Ok(client)
+        }
+        Err(e) => Err(format!("CARLA not ready: {e}")),
     }
 }
