@@ -1,19 +1,19 @@
 [package]
-name = "carla_world"
+name = "swb_carla_world"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "The CARLA world server: CARLA behind the world protocol, for the scenario bridge"
 
 [[bin]]
-name = "carla_world"
+name = "swb_carla_world"
 path = "src/main.rs"
 
 [package.metadata.ros]
 install_to_share = ["config", "launch"]
 
 [dependencies]
-swb_core = { path = "../swb_core" }
+swb_core = { path = "../deps/swb_world_protocol/swb_core" }
 # CARLA: the version is the workspace's feature (CLAUDE.md, "The CARLA version is a Cargo
 # feature").
 carla.workspace = true

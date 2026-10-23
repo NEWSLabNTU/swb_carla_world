@@ -1,9 +1,9 @@
 //! The CARLA world server (roadmap 046): CARLA behind the world protocol, for the scenario
 //! bridge.
 //!
-//!     carla_world [--generate-signal-table <map dir>] --ros-args -p port:=5591 \
+//!     swb_carla_world [--generate-signal-table <map dir>] --ros-args -p port:=5591 \
 //!         -p carla_host:=localhost -p carla_port:=2000 -p ssv2_port:=5555 \
-//!         [-p config_file:=<carla_world.yaml>]
+//!         [-p config_file:=<swb_carla_world.yaml>]
 //!
 //! One process per CARLA server, and the only one that ticks it: it holds an exclusive lock
 //! on `/tmp/swb-locks/carla-<host>-<port>.lock` for its whole life, and a second one is
@@ -68,7 +68,7 @@ fn main() -> Result<()> {
     world_server::die_with_parent();
 
     let params = ros_args::RosParams::from_args(std::env::args().skip(1))?;
-    let config_file = ros_args::config_file_for(&params, "carla_world", "carla_world.yaml");
+    let config_file = ros_args::config_file_for(&params, "swb_carla_world", "swb_carla_world.yaml");
     let config_dir = config_file
         .parent()
         .map(Path::to_path_buf)

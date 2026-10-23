@@ -342,7 +342,7 @@ impl World for CarlaWorld {
             && req.role_name != backend.ego_role_name()
         {
             return Err(Refusal::new(format!(
-                "the ego's role name is '{}' on the bridge and '{}' here (carla_world.yaml \
+                "the ego's role name is '{}' on the bridge and '{}' here (swb_carla_world.yaml \
                  ego.role_name): acb attaches by it, so they must agree",
                 req.role_name,
                 backend.ego_role_name()

@@ -4,7 +4,7 @@
   Included by swb_launch carla_simulation.launch.xml, beside the bridge and the agent relay,
   so the three share one launch, one process group and one stop.
 
-    play_launch launch carla_world carla_world.launch.xml [port:=5591] [carla_host:=localhost]
+    play_launch launch swb_carla_world swb_carla_world.launch.xml [port:=5591] [carla_host:=localhost]
         [carla_port:=2000] [ssv2_port:=5555] [config_file:=...] [npc_contact_sensors:=false]
 
   One per CARLA server: a second against the same CARLA, or on the same port, exits 1 at once
@@ -15,8 +15,8 @@
 -->
 <launch>
   <arg name="port" default="5591" description="the world protocol's REP port on 127.0.0.1"/>
-  <arg name="config_file" default="$(find-pkg-share carla_world)/config/carla_world.yaml"
-       description="carla_world.yaml (CARLA, blueprints, map aliases, ticks, Traffic Manager, sensor release)"/>
+  <arg name="config_file" default="$(find-pkg-share swb_carla_world)/config/swb_carla_world.yaml"
+       description="swb_carla_world.yaml (CARLA, blueprints, map aliases, ticks, Traffic Manager, sensor release)"/>
   <arg name="carla_host" default="" description="CARLA host; empty keeps the config file's"/>
   <arg name="carla_port" default="" description="CARLA RPC port; empty keeps the config file's"/>
   <arg name="ssv2_port" default=""
@@ -24,7 +24,7 @@
   <arg name="npc_contact_sensors" default=""
        description="true | false: a collision sensor on every tracked NPC vehicle, for the gap trace and oracle (roadmap 032); empty keeps the config file's (default true)"/>
 
-  <node pkg="carla_world" exec="carla_world" name="carla_world"
+  <node pkg="swb_carla_world" exec="swb_carla_world" name="swb_carla_world"
         output="screen" respawn="true" respawn_delay="2.0">
     <param name="port" value="$(var port)"/>
     <param name="config_file" value="$(var config_file)"/>

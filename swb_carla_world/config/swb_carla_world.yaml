@@ -1,6 +1,6 @@
 # The CARLA world server's configuration (roadmap 046): CARLA behind the world protocol.
 #
-# carla_world reads the file its ROS parameter `config_file` names (default this installed
+# swb_carla_world reads the file its ROS parameter `config_file` names (default this installed
 # copy); per-map files (blueprint_boxes_<version>.yaml) sit beside it. Precedence: ROS
 # parameters (carla_host, carla_port, ssv2_port, port) > environment (CARLA_HOST, CARLA_PORT,
 # SSV2_PORT) > this file > built-in default. A missing file is fine; a malformed one is fatal,
@@ -24,7 +24,7 @@ ssv2:
 # The scenario ego.
 ego:
   # The name the simulator gives the ego vehicle (CARLA's role_name): its vehicle bridge
-  # finds it by this. The CARLA world server's carla_world.yaml must say the same.
+  # finds it by this. The CARLA world server's swb_carla_world.yaml must say the same.
   role_name: "hero"
 # SSv2 asset key -> CARLA blueprint.
 #

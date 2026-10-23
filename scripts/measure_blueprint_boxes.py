@@ -9,7 +9,7 @@ it, and writes the table the world server picks bodies from and scenarios take t
 from (`scripts/scenario_vehicle.py`):
 
     scripts/measure_blueprint_boxes.py [--host H] [--port P]
-        [--output src/carla_world/config/blueprint_boxes_<version>.yaml]
+        [--output swb_carla_world/config/blueprint_boxes_<version>.yaml]
 
 A vehicle's `axles` are in the actor's frame (x forward, as ROS; metres): `front_x` and
 `rear_x`, the axle centres' x from the actor origin; `track`, the rear wheels' distance;
@@ -118,7 +118,7 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=2000)
     ap.add_argument("--timeout", type=float, default=30.0)
     ap.add_argument("--output", type=Path,
-                    help="default: src/carla_world/config/"
+                    help="default: swb_carla_world/config/"
                          "blueprint_boxes_<server version>.yaml")
     args = ap.parse_args()
 
@@ -154,7 +154,7 @@ def main() -> int:
                   f" {entry.get('base_type', '')}")
 
     output = args.output or (Path(__file__).resolve().parent.parent
-                             / "src/carla_world/config"
+                             / "swb_carla_world/config"
                              / f"blueprint_boxes_{version}.yaml")
     header = (
         f"# Bounding boxes of CARLA {version}'s blueprints, measured from spawned actors.\n"

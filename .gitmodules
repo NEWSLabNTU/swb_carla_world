@@ -1,0 +1,4 @@
+[submodule "deps/swb_world_protocol"]
+	path = deps/swb_world_protocol
+	url = https://github.com/NEWSLabNTU/swb_world_protocol.git
+	branch = target-shape

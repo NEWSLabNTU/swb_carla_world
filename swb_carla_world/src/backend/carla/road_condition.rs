@@ -136,10 +136,12 @@ mod tests {
     /// scenario brakes alike on both simulators.
     #[test]
     fn wet_factors_match_the_isaac_class_table() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../isaac_world/config/surface_classes.yaml"
-        );
+        // Isaac's table is swb_isaac_world's; scenario-world-bridge, which holds both world
+        // servers, points SWB_ISAAC_SURFACE_CLASSES at it in its `just test`.
+        let Some(path) = std::env::var_os("SWB_ISAAC_SURFACE_CLASSES") else {
+            eprintln!("SKIPPED: SWB_ISAAC_SURFACE_CLASSES unset; not compared with Isaac's table");
+            return;
+        };
         let table: serde_yaml::Value =
             serde_yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         let wet = &table["classes"]["asphalt"]["wet"];

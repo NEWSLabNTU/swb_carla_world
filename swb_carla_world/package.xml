@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>carla_world</name>
+  <name>swb_carla_world</name>
   <version>0.1.0</version>
   <description>The CARLA world server: CARLA behind the world protocol, for the scenario bridge (roadmap 046)</description>
   <maintainer email="maintainer@example.com">Maintainer</maintainer>
