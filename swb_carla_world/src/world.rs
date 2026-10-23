@@ -386,6 +386,8 @@ impl World for CarlaWorld {
                 origin_yaw: b.origin_offset[2],
                 declared_center: v3(b.declared_center),
                 declared_dimensions: v3(b.declared_dimensions),
+                // The blueprint's own physics until the spec's are applied (roadmap 051 K3).
+                spec_hash: String::new(),
                 wheels: b.wheels.map(|w| wire::Wheels {
                     front_x: w[0],
                     rear_x: w[1],
