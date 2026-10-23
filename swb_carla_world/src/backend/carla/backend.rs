@@ -440,6 +440,7 @@ fn fallback_spawn_height(commanded_z: f32) -> f32 {
 use super::collision_monitor::CollisionMonitor;
 use super::road_condition::{self, Applied as AppliedRoad};
 use super::scenario_weather::{self, Sky};
+use super::weather::Weather;
 use crate::actor_census;
 use crate::backend::{
     BackendError, Driver, EntityKind, EntityStatus, Environment, Episode, Goal, Sensor, SimBackend,
@@ -456,8 +457,7 @@ use crate::proto::traffic_simulator_msgs::{self, BoundingBox};
 use crate::sensor_release::SensorReleaseNotifier;
 use crate::sim_time::{fmt_ns, sim_ns};
 use crate::spawn_ladder;
-use crate::weather::WeatherReply;
-use crate::weather::{Weather, WeatherRequest};
+use crate::weather::{WeatherReply, WeatherRequest};
 use swb_core::environment::{self, TimeOfDay};
 
 /// `(elapsed_seconds, delta_seconds)` of `world`'s current snapshot.
@@ -1226,9 +1226,9 @@ impl CarlaBackend {
         let contact_report_dir = config.contact_report_dir();
         let world_id = world.id().ok();
         let agent_ledger = agent_link::ledger_path(&carla_host, carla_port);
-        // Validated by BridgeConfig::validate, so an unknown name cannot get this far.
+        // Checked at start (main), so an unknown name cannot get this far.
         let requested_weather =
-            crate::weather::preset(config.weather.trim()).map(|(name, w)| (name.to_string(), w));
+            super::weather::preset(config.weather.trim()).map(|(name, w)| (name.to_string(), w));
         let blueprint_boxes = BoxTable::load_for(&config_dir, super::version::BUILT_FOR);
         let gap_trace = GapTrace::new(config.gap_trace_dir());
         let mut collision_monitor =
@@ -1477,12 +1477,17 @@ impl CarlaBackend {
     /// afterwards. Remembered even when applying fails (CARLA unreachable), so the next
     /// reconnect applies it.
     pub fn set_weather(&mut self, request: WeatherRequest) -> WeatherReply {
-        let (label, w) = match request {
-            WeatherRequest::Preset(name, w) => (name.to_string(), w),
-            WeatherRequest::Parameters(fields) => match self.weather() {
-                Ok(current) => ("custom".to_string(), current.with_user_fields(fields)),
-                Err(e) => return WeatherReply::failed(format!("{e}; nothing changed"), None),
-            },
+        let current = match (&request, self.weather()) {
+            (_, Ok(now)) => now,
+            // A preset needs nothing of CARLA's; parameters do.
+            (WeatherRequest::Preset(_), Err(_)) => super::weather::Weather::from_fields([0.0; 14]),
+            (WeatherRequest::Parameters(_), Err(e)) => {
+                return WeatherReply::failed(format!("{e}; nothing changed"), None)
+            }
+        };
+        let (label, w) = match super::weather::resolve(&request, current) {
+            Ok(r) => r,
+            Err(e) => return WeatherReply::failed(e, None),
         };
         self.requested_weather = Some((label.clone(), w));
         // The user's weather replaces the scenario's too.
@@ -1496,7 +1501,7 @@ impl CarlaBackend {
         tracing::info!("Weather {label} applied (set_weather)");
         match self.weather() {
             Ok(now) => WeatherReply::ok(
-                now,
+                super::weather::generic(&now),
                 format!("weather {label} applied; kept across map loads"),
             ),
             Err(e) => WeatherReply::failed(format!("applied {label}, but {e}"), None),
@@ -1719,10 +1724,10 @@ impl CarlaBackend {
         match self.weather() {
             Ok(w) => {
                 let kept = match &self.requested_weather {
-                    Some((label, _)) => format!("bridge keeps {label} across map loads"),
-                    None => "bridge leaves the weather to CARLA".to_string(),
+                    Some((label, _)) => format!("the world server keeps {label} across map loads"),
+                    None => "the world server leaves the weather to CARLA".to_string(),
                 };
-                WeatherReply::ok(w, kept)
+                WeatherReply::ok(super::weather::generic(&w), kept)
             }
             Err(e) => WeatherReply::failed(e.to_string(), None),
         }

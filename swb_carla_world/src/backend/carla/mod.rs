@@ -13,7 +13,7 @@ pub mod scenario_weather;
 pub mod traffic_light_mapper;
 pub mod vehicle_physics;
 pub mod version;
-mod weather;
+pub(crate) mod weather;
 
 use carla::client::Client;
 use std::path::PathBuf;

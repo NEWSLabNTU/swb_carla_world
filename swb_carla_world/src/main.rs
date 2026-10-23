@@ -74,6 +74,11 @@ fn main() -> Result<()> {
     let mut config = config::BridgeConfig::load_for(&config_file, config::ConfigOwner::CarlaWorld)?;
     config.apply_env_overrides();
     config.apply_ros_params(&params)?;
+    // The weather preset is CARLA's to name (roadmap 051): an unknown one stops the start.
+    if !config.weather.trim().is_empty() {
+        backend::carla::weather::preset_or_err(config.weather.trim())
+            .map_err(|e| eyre::eyre!("weather: {e}"))?;
+    }
     // The bridge writes the contact reports and the gap trace from what this server sends.
     config.contact_report_dir = Some(contact_report::OFF.to_string());
     config.gap_trace_dir = String::new();

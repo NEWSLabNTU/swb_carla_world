@@ -9,8 +9,8 @@
 //! UE's +x on CARLA's maps, also clockwise seen from above -- assumed, not checked against
 //! CARLA's renderer. A sun's illuminance has no CARLA counterpart and is ignored.
 
+use super::weather::Weather;
 use swb_core::environment::{PrecipitationType, ScenarioWeather};
-use swb_core::weather::Weather;
 
 /// The weather fields the scenario has set so far; a part not given keeps its last value.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -94,7 +94,7 @@ mod tests {
     use swb_core::environment::{Precipitation, Sun, Wind};
 
     fn clear_noon() -> Weather {
-        swb_core::weather::preset("ClearNoon").unwrap().1
+        super::super::weather::preset("ClearNoon").unwrap().1
     }
 
     #[test]

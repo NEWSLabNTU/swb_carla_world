@@ -9,8 +9,8 @@
 //! hydroplaning and the map's zones (`swb.zone.*`) are the Isaac world server's surface
 //! layer; their properties are refused here.
 
+use super::weather::Weather;
 use swb_core::sim::RoadCondition;
-use swb_core::weather::Weather;
 
 /// Asphalt's friction factor per wetness level, dry first: `surface_classes.yaml`'s
 /// `classes.asphalt.wet`.
