@@ -11,6 +11,7 @@ pub mod resolved_signals;
 pub mod road_condition;
 pub mod scenario_weather;
 pub mod traffic_light_mapper;
+pub mod vehicle_physics;
 pub mod version;
 mod weather;
 

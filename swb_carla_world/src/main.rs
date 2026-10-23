@@ -124,7 +124,25 @@ fn main() -> Result<()> {
         config_file.display()
     );
 
-    let mut world = world::CarlaWorld::new(config, config_dir);
+    // sim_vehicle_spec's carla_physics.yaml (roadmap 051 K3); empty: the blueprints' own.
+    let vehicle_physics = match params
+        .path("vehicle_physics")
+        .filter(|p| p.as_os_str() != "none")
+    {
+        Some(path) => {
+            let p = carla_physics_spec::CarlaPhysics::load(&path).map_err(|e| eyre::eyre!(e))?;
+            tracing::info!(
+                "Vehicle physics {} ({}, spec_hash {})",
+                path.display(),
+                p.blueprint,
+                &p.spec_hash[..p.spec_hash.len().min(12)]
+            );
+            Some(p)
+        }
+        None => None,
+    };
+    let mut world =
+        world::CarlaWorld::new(config, config_dir).with_vehicle_physics(vehicle_physics);
     world.try_connect();
     let mut shell = Shell::new(world);
     let end = world_server::serve(&socket, &mut shell, &shutdown, budgets::IDLE_PROBE_AFTER)?;

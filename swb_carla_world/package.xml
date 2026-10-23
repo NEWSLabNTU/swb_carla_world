@@ -12,6 +12,8 @@
   <build_depend>libclang-dev</build_depend>
   <build_depend>protobuf-dev</build_depend>
   <depend>libzmq3-dev</depend>
+  <!-- the vehicle physics the launch passes (generated/<car>/carla_physics.yaml) -->
+  <exec_depend>sim_vehicle_spec</exec_depend>
 
   <export>
     <build_type>ament_cargo</build_type>

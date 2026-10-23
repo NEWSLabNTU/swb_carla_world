@@ -6,6 +6,7 @@
 
     play_launch launch swb_carla_world swb_carla_world.launch.xml [port:=5591] [carla_host:=localhost]
         [carla_port:=2000] [ssv2_port:=5555] [config_file:=...] [npc_contact_sensors:=false]
+        [vehicle_physics:=<carla_physics.yaml>|none]
 
   One per CARLA server: a second against the same CARLA, or on the same port, exits 1 at once
   (it holds /tmp/swb-locks/carla-<host>-<port>.lock and binds its port first). A hung CARLA
@@ -24,6 +25,9 @@
   <arg name="npc_contact_sensors" default=""
        description="true | false: a collision sensor on every tracked NPC vehicle, for the gap trace and oracle (roadmap 032); empty keeps the config file's (default true)"/>
 
+  <arg name="vehicle_physics" default="$(find-pkg-share sim_vehicle_spec)/generated/tesla_model3/carla_physics.yaml"
+       description="sim_vehicle_spec's carla_physics.yaml: the physics the ego and agent vehicles of its blueprint run (roadmap 051); none = the blueprints' own"/>
+
   <node pkg="swb_carla_world" exec="swb_carla_world" name="swb_carla_world"
         output="screen" respawn="true" respawn_delay="2.0">
     <param name="port" value="$(var port)"/>
@@ -32,5 +36,6 @@
     <param name="carla_port" value="$(var carla_port)"/>
     <param name="ssv2_port" value="$(var ssv2_port)"/>
     <param name="npc_contact_sensors" value="$(var npc_contact_sensors)"/>
+    <param name="vehicle_physics" value="$(var vehicle_physics)"/>
   </node>
 </launch>

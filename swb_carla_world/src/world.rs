@@ -46,6 +46,8 @@ pub struct CarlaWorld {
     /// Handle by name.
     handles: BTreeMap<String, u32>,
     map_origin: [f64; 3],
+    /// The vehicle spec's physics, for every backend this server connects (roadmap 051 K3).
+    vehicle_physics: Option<carla_physics_spec::CarlaPhysics>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,7 +83,17 @@ impl CarlaWorld {
             entities: BTreeMap::new(),
             handles: BTreeMap::new(),
             map_origin: [0.0; 3],
+            vehicle_physics: None,
         }
+    }
+
+    /// The vehicle spec's physics the ego and agent vehicles get (`vehicle_physics`).
+    pub fn with_vehicle_physics(
+        mut self,
+        physics: Option<carla_physics_spec::CarlaPhysics>,
+    ) -> Self {
+        self.vehicle_physics = physics;
+        self
     }
 
     pub fn backend_mut(&mut self) -> Option<&mut CarlaBackend> {
@@ -126,6 +138,7 @@ impl CarlaWorld {
             self.config_dir.clone(),
             self.config.clone(),
         );
+        backend.set_vehicle_physics(self.vehicle_physics.clone());
         backend.before_serving();
         self.backend = Some(backend);
         self.not_ready.clear();
@@ -386,8 +399,7 @@ impl World for CarlaWorld {
                 origin_yaw: b.origin_offset[2],
                 declared_center: v3(b.declared_center),
                 declared_dimensions: v3(b.declared_dimensions),
-                // The blueprint's own physics until the spec's are applied (roadmap 051 K3).
-                spec_hash: String::new(),
+                spec_hash: b.spec_hash,
                 wheels: b.wheels.map(|w| wire::Wheels {
                     front_x: w[0],
                     rear_x: w[1],

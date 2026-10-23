@@ -1179,6 +1179,9 @@ pub struct CarlaBackend {
     /// Each vehicle's own tire friction per wheel, by actor id, read before the road first
     /// scaled it.
     own_friction: HashMap<u32, Vec<f32>>,
+    /// sim_vehicle_spec's carla_physics.yaml (roadmap 051 K3): put on every vehicle a vehicle
+    /// stack drives whose body is its blueprint. `None`: the blueprint's own physics.
+    vehicle_physics: Option<carla_physics_spec::CarlaPhysics>,
     /// The weather before the scenario changed it (the road's look, its sky), put back at
     /// `Initialize`; a `set_weather` in between replaces it.
     weather_before_scenario: Option<Weather>,
@@ -1217,6 +1220,9 @@ pub struct SpawnBody {
     pub origin_offset: [f64; 3],
     pub declared_center: [f64; 3],
     pub declared_dimensions: [f64; 3],
+    /// The vehicle spec of the physics applied to it (roadmap 051), empty for the
+    /// blueprint's own.
+    pub spec_hash: String,
     /// A vehicle's wheels from the measured table, in the entity frame (roadmap 051):
     /// `[front_x, rear_x, track, radius]`; `None` for a body the table has no axles for, or
     /// one spawned turned.
@@ -1361,6 +1367,7 @@ impl CarlaBackend {
             requested_weather,
             road: DRY_ROAD,
             own_friction: HashMap::new(),
+            vehicle_physics: None,
             weather_before_scenario: None,
             sky: Sky::default(),
             scenario_clock: None,
@@ -1677,6 +1684,39 @@ impl CarlaBackend {
                 tracing::warn!("Time of day: {e:#}");
             }
         }
+    }
+
+    /// The physics a vehicle stack's car runs: `carla_physics.yaml` (`vehicle_physics`), set
+    /// once and read back, on a vehicle whose blueprint is the file's. Another body keeps its
+    /// blueprint's (and says so): its vehicle bridge refuses it.
+    pub fn set_vehicle_physics(&mut self, physics: Option<carla_physics_spec::CarlaPhysics>) {
+        self.vehicle_physics = physics;
+    }
+
+    /// Put the vehicle spec's physics on `actor` when it is the file's blueprint: the
+    /// physics, to read back after the next tick. Another body keeps its own (and says so).
+    fn put_vehicle_physics(
+        &self,
+        name: &str,
+        actor: &carla::client::Actor,
+        blueprint: &str,
+    ) -> Result<Option<carla_physics_spec::CarlaPhysics>> {
+        let Some(physics) = self.vehicle_physics.clone() else {
+            return Ok(None);
+        };
+        if blueprint != physics.blueprint {
+            tracing::warn!(
+                "'{name}' is a {blueprint}, not the vehicle physics' {}: it keeps its \
+                 blueprint's physics",
+                physics.blueprint
+            );
+            return Ok(None);
+        }
+        let carla::client::ActorKind::Vehicle(vehicle) = actor.clone().into_kinds() else {
+            return Ok(None);
+        };
+        super::vehicle_physics::apply(&vehicle, &physics)?;
+        Ok(Some(physics))
     }
 
     /// A vehicle's tire friction: its own times the road's factor. Not a vehicle: nothing.
@@ -4393,6 +4433,22 @@ impl CarlaBackend {
             );
         }
 
+        // A vehicle stack's car gets its vehicle spec's physics (roadmap 051 K3), before the
+        // settling tick that applies it and before the road's friction, which then scales
+        // the spec's tires.
+        let spec_physics = if matches!(kind, SpawnKind::Ego | SpawnKind::AgentVehicle) {
+            match self.put_vehicle_physics(name, &actor, &blueprint_key) {
+                Ok(p) => p,
+                Err(e) => {
+                    return failed(format!(
+                        "Spawned '{name}' but cannot give it its vehicle spec's physics: {e:#}"
+                    ))
+                }
+            }
+        } else {
+            None
+        };
+
         // Wait one tick for the actor to be fully initialized. Only meaningful once we
         // own the tick -- before sync mode is on, CARLA is advancing by itself.
         //
@@ -4410,6 +4466,32 @@ impl CarlaBackend {
             }
         }
 
+        // The settling tick applied the physics: read it back.
+        let spec_hash = match &spec_physics {
+            Some(p) if self.sync_mode_enabled => {
+                if let carla::client::ActorKind::Vehicle(vehicle) = actor.clone().into_kinds() {
+                    if let Err(e) = super::vehicle_physics::check(&vehicle, p) {
+                        return failed(format!(
+                            "Spawned '{name}' but its vehicle spec's physics did not take: {e:#}"
+                        ));
+                    }
+                }
+                tracing::info!(
+                    "'{name}' runs its vehicle spec's physics (spec_hash {}, {} kg)",
+                    &p.spec_hash[..p.spec_hash.len().min(12)],
+                    p.vehicle.mass
+                );
+                p.spec_hash.clone()
+            }
+            Some(_) => {
+                tracing::warn!(
+                    "'{name}': its vehicle spec's physics is applied but not read \
+                                back (no tick of ours yet)"
+                );
+                String::new()
+            }
+            None => String::new(),
+        };
         self.last_spawn_body = Some(SpawnBody {
             actor_id,
             blueprint: blueprint_key.clone(),
@@ -4420,6 +4502,7 @@ impl CarlaBackend {
                 .declared
                 .map_or([0.0; 3], |d| [d.length, d.width, d.height]),
             wheels: entity_wheels(self.blueprint_boxes.as_ref(), &blueprint_key, origin_offset),
+            spec_hash,
         });
         // Everything SSv2 spawns is registered (SpawnKind::entity_type).
         if let Some(entity_type) = kind.entity_type() {
