@@ -332,6 +332,8 @@ impl World for CarlaWorld {
                 performance: req
                     .performance
                     .map(|p| (p.max_acceleration, p.max_deceleration)),
+                // The bridge compares the body with SSv2's declared wheels, not this server.
+                wheels: None,
             },
             wire::Kind::Pedestrian => EntityKind::Pedestrian,
             _ => EntityKind::MiscObject,
@@ -384,6 +386,12 @@ impl World for CarlaWorld {
                 origin_yaw: b.origin_offset[2],
                 declared_center: v3(b.declared_center),
                 declared_dimensions: v3(b.declared_dimensions),
+                wheels: b.wheels.map(|w| wire::Wheels {
+                    front_x: w[0],
+                    rear_x: w[1],
+                    track: w[2],
+                    radius: w[3],
+                }),
             },
             None => wire::Body::default(),
         })

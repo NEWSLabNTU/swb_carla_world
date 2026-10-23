@@ -1217,6 +1217,10 @@ pub struct SpawnBody {
     pub origin_offset: [f64; 3],
     pub declared_center: [f64; 3],
     pub declared_dimensions: [f64; 3],
+    /// A vehicle's wheels from the measured table, in the entity frame (roadmap 051):
+    /// `[front_x, rear_x, track, radius]`; `None` for a body the table has no axles for, or
+    /// one spawned turned.
+    pub wheels: Option<[f64; 4]>,
 }
 
 /// One tracked entity's state this frame, for the world protocol's `TrackingSample`.
@@ -4415,6 +4419,7 @@ impl CarlaBackend {
             declared_dimensions: shape
                 .declared
                 .map_or([0.0; 3], |d| [d.length, d.width, d.height]),
+            wheels: entity_wheels(self.blueprint_boxes.as_ref(), &blueprint_key, origin_offset),
         });
         // Everything SSv2 spawns is registered (SpawnKind::entity_type).
         if let Some(entity_type) = kind.entity_type() {
@@ -4484,6 +4489,7 @@ impl CarlaBackend {
                 subtype,
                 axles,
                 performance,
+                ..
             } => self.spawn_vehicle(req, *driver, *subtype, *axles, *performance),
             // No AI walker controller. SSv2's behaviour plugins compute the walk and send a
             // pose every frame, so a controller would be a second authority over the same
@@ -6710,6 +6716,26 @@ fn measured_vehicle_box_center(
     .then_some(bp.center)
 }
 
+/// A vehicle body's wheels in the entity frame: the measured table's axles (actor frame)
+/// moved by the origin offset, `[front_x, rear_x, track, radius]` (roadmap 051). For the
+/// Model 3 declared with its measured box, the rear axle lands on the entity origin.
+fn entity_wheels(
+    table: Option<&BoxTable>,
+    blueprint_key: &str,
+    origin_offset: OriginOffset,
+) -> Option<[f64; 4]> {
+    if origin_offset.yaw != 0.0 {
+        return None;
+    }
+    let a = table?.get(blueprint_key)?.axles.as_ref()?;
+    Some([
+        origin_offset.x + a.front_x,
+        origin_offset.x + a.rear_x,
+        a.track,
+        a.wheel_radius,
+    ])
+}
+
 /// The origin offset an SSv2 entity declares: its `bounding_box.center` x and y. Absent or
 /// zero (pedestrians and misc objects usually) means the SSv2 and CARLA origins coincide.
 ///
@@ -7456,6 +7482,27 @@ mod tests {
         // A walker's or prop's body never moves this way.
         assert_eq!(
             measured_vehicle_box_center(Some(&table), "static.prop.trafficcone01", &shape),
+            None
+        );
+    }
+
+    /// The catalog's Model 3 (roadmap 051): its measured wheels moved into the entity frame
+    /// put the rear axle on the entity origin, the front at the wheelbase.
+    #[test]
+    fn the_wheels_are_reported_in_the_entity_frame() {
+        let table =
+            BoxTable::from_yaml(include_str!("../../../config/blueprint_boxes_0.9.16.yaml"))
+                .unwrap();
+        let m3 = "vehicle.tesla.model3";
+        let offset = |x, yaw| OriginOffset { x, y: 0.0, yaw };
+        // Declared centre 1.416 less CARLA's 0.029: the actor origin 1.387 ahead.
+        let w = entity_wheels(Some(&table), m3, offset(1.387, 0.0)).unwrap();
+        assert!((w[0] - 3.005).abs() < 0.002 && w[1].abs() < 0.002, "{w:?}");
+        assert_eq!((w[2], w[3]), (1.667, 0.37));
+        assert_eq!(entity_wheels(Some(&table), m3, offset(1.387, 1.0)), None);
+        assert_eq!(entity_wheels(None, m3, offset(1.387, 0.0)), None);
+        assert_eq!(
+            entity_wheels(Some(&table), "static.prop.trafficcone01", offset(0.0, 0.0)),
             None
         );
     }
