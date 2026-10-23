@@ -785,6 +785,31 @@ fn decide_frame_action(sync_mode_enabled: bool, has_ego: bool) -> FrameAction {
 /// completes a phase during any scenario. See `hold_light_phases`.
 const HOLD_PHASE_SECONDS: f32 = 99_999.0;
 
+/// CARLA's own phase durations for a light (green, yellow, red, s), used when a light is found
+/// already held -- by a server that died without restoring it -- so its real timings are lost.
+const CARLA_DEFAULT_PHASES: (f32, f32, f32) = (10.0, 3.0, 2.0);
+
+/// What to save for light `id` before holding it: nothing when it is already saved (holding
+/// twice must not save the held values over its own, roadmap 051: a restore then left every
+/// light held for the next user of the server), CARLA's defaults when it reads as already held,
+/// else what it read.
+fn timings_to_restore(
+    saved: &[(u32, f32, f32, f32)],
+    id: u32,
+    read: Option<(f32, f32, f32)>,
+) -> Option<(f32, f32, f32)> {
+    if saved.iter().any(|(i, ..)| *i == id) {
+        return None;
+    }
+    let (g, y, r) = read?;
+    let held = |v: f32| (v - HOLD_PHASE_SECONDS).abs() < 1.0;
+    Some(if held(g) || held(r) {
+        CARLA_DEFAULT_PHASES
+    } else {
+        (g, y, r)
+    })
+}
+
 /// Longest PhysX substep the bridge lets CARLA take, in seconds.
 ///
 /// CARLA's default is 0.01 s. On 0.9.16 that shows up as phantom yaw rate -- up to 0.9 °/s
@@ -2782,7 +2807,8 @@ impl CarlaBackend {
         }
     }
 
-    /// Back up the freeze: stretch every light's phases to [`HOLD_PHASE_SECONDS`].
+    /// Back up the freeze: stretch every light's phases to [`HOLD_PHASE_SECONDS`]. Each light's
+    /// own timings are saved once, the first time ([`timings_to_restore`]).
     ///
     /// tier4/carla-autoware-native found `freeze_all_traffic_lights` skips dynamically
     /// placed light groups; those kept cycling and overrode `set_state` within ~22 s. A
@@ -2825,7 +2851,9 @@ impl CarlaBackend {
             match outcome {
                 Ok(()) => {
                     held += 1;
-                    if let Ok((g, y, r)) = saved {
+                    if let Some((g, y, r)) =
+                        timings_to_restore(&self.held_light_timings, id, saved.ok())
+                    {
                         self.held_light_timings.push((id, g, y, r));
                     }
                 }
@@ -6562,6 +6590,19 @@ fn release_needed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_light_is_saved_once_and_never_as_held() {
+        let read = Some((8.0, 3.0, 2.0));
+        assert_eq!(timings_to_restore(&[], 7, read), Some((8.0, 3.0, 2.0)));
+        // Held twice: the second save would be the held values; keep the first.
+        let saved = [(7, 8.0, 3.0, 2.0)];
+        let held = Some((HOLD_PHASE_SECONDS, HOLD_PHASE_SECONDS, HOLD_PHASE_SECONDS));
+        assert_eq!(timings_to_restore(&saved, 7, held), None);
+        // Found held by a server that died: CARLA's defaults, not a day-long phase.
+        assert_eq!(timings_to_restore(&[], 8, held), Some(CARLA_DEFAULT_PHASES));
+        assert_eq!(timings_to_restore(&[], 9, None), None);
+    }
 
     #[test]
     fn release_needed_only_for_a_vehicle_somebody_may_listen_to() {
