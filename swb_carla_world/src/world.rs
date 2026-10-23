@@ -101,7 +101,7 @@ impl CarlaWorld {
     }
 
     /// One attempt to reach CARLA, at most every [`CONNECT_EVERY`]. Builds the backend on
-    /// success: the epoch marker, the configured weather (`before_serving`).
+    /// success: the configured weather (`before_serving`).
     pub fn try_connect(&mut self) {
         if self.backend.is_some()
             || self
@@ -302,6 +302,7 @@ impl World for CarlaWorld {
         };
         let result = backend.initialize(&episode);
         let ns = result.map_err(|e| refusal(e, backend))?;
+        let episode_id = backend.episode_id();
         // CARLA's origin and the bridge's must agree, or every pose is off by the difference.
         let ours = backend.map_origin();
         if ours != self.map_origin {
@@ -313,7 +314,10 @@ impl World for CarlaWorld {
         }
         self.entities.clear();
         self.handles.clear();
-        Ok(wire::LoadWorldReply { sim_time_ns: ns })
+        Ok(wire::LoadWorldReply {
+            sim_time_ns: ns,
+            episode_id,
+        })
     }
 
     fn spawn(&mut self, handle: u32, req: &wire::Spawn) -> WorldResult<wire::Body> {
@@ -553,6 +557,7 @@ impl World for CarlaWorld {
         let tick = backend.take_tick_time();
         let ns = result.map_err(|e| refusal(e, backend))?;
         let frame = backend.last_tick_frame().unwrap_or(0);
+        let episode_id = backend.episode_id();
         let states = if req.want_states {
             backend.actor_states()
         } else {
@@ -591,6 +596,7 @@ impl World for CarlaWorld {
             contacts,
             sim_time_ns: ns,
             tick_seconds: tick.as_secs_f64(),
+            episode_id,
         })
     }
 

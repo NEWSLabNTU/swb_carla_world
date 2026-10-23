@@ -448,15 +448,13 @@ use crate::backend::{
 use crate::contact_report::ReportGeometry;
 use crate::coordinate_conversion::{self, MapOrigin, OriginOffset};
 use crate::entity_manager::{EntityManager, EntityType};
-use crate::episode_clock::{
-    fmt_ns, old_episode_last_elapsed, reload_as_pause, tick_then_read, EpisodeClock, EpisodeReload,
-};
 use crate::npc_tracking::{self, Steering};
 use crate::proto::geometry_msgs::{self, Pose};
 use crate::proto::simulation_api_schema::TrafficSignal;
 use crate::proto::traffic_simulator_msgs::entity_subtype::Enum as EntitySubtype;
 use crate::proto::traffic_simulator_msgs::{self, BoundingBox};
 use crate::sensor_release::SensorReleaseNotifier;
+use crate::sim_time::{fmt_ns, sim_ns};
 use crate::spawn_ladder;
 use crate::weather::WeatherReply;
 use crate::weather::{Weather, WeatherRequest};
@@ -480,11 +478,6 @@ impl std::fmt::Display for TickFailure {
         }
     }
 }
-
-/// How long swb waits at connect for a frame of a world CARLA ticks by itself, to write
-/// the epoch marker (`write_epoch_marker_at_connect`). One tick of a loaded server is well
-/// under a second.
-const CONNECT_FRAME_WAIT: Duration = Duration::from_secs(2);
 
 /// CARLA's frame and synchronous-mode settings for the log after a hung tick, read on a
 /// thread of its own so that a CARLA that no longer answers cannot hang the reply too.
@@ -530,36 +523,6 @@ fn read_frame_of(world: &World) -> Result<(f64, f64)> {
     let snapshot = world.snapshot().wrap_err("world snapshot")?;
     let ts = snapshot.timestamp();
     Ok((ts.elapsed_seconds, ts.delta_seconds))
-}
-
-/// The backend's CARLA calls for one episode change, in the shape
-/// [`reload_as_pause`] orders them.
-struct CarlaReload<'a> {
-    backend: &'a mut CarlaBackend,
-    town: &'a str,
-    current_town: &'a str,
-    /// Frame number of the pre-reload snapshot, for the frame count after the load.
-    f0: Option<u64>,
-}
-
-impl EpisodeReload for CarlaReload<'_> {
-    type World = carla::client::World;
-    type Error = eyre::Report;
-
-    fn enter_sync(&mut self) -> Result<()> {
-        self.backend.enable_sync_mode()
-    }
-
-    fn read_frame(&mut self) -> Result<(f64, f64)> {
-        let snapshot = self.backend.world.snapshot().wrap_err("world snapshot")?;
-        let ts = snapshot.timestamp();
-        self.f0 = Some(snapshot.frame() as u64);
-        Ok((ts.elapsed_seconds, ts.delta_seconds))
-    }
-
-    fn reload(&mut self) -> Result<carla::client::World> {
-        self.backend.prepare_map(self.town, self.current_town)
-    }
 }
 
 /// A census of CARLA's actors (034 step 5): what a short-lived client found by id.
@@ -1103,12 +1066,6 @@ pub struct CarlaBackend {
     config_dir: PathBuf,
     /// Map directory name to CARLA town, for maps whose directory is not the town name.
     map_aliases: HashMap<String, String>,
-    /// CARLA time plus the episode epoch, reported to SSv2 (roadmap 015).
-    episode_clock: EpisodeClock,
-    /// Why the world's epoch marker is still to be checked against `episode_clock`
-    /// (`epoch_marker`), if it is: set at start-up and on every episode change, cleared once
-    /// swb could see the world's actors.
-    epoch_marker_due: Option<&'static str>,
     /// Lanelet2 signal ID to OpenDRIVE sign ID for the loaded town.
     signal_map: SignalMap,
     /// Lanelet2 signal IDs already reported as unmapped. SSv2 sends states every frame, so
@@ -1121,19 +1078,16 @@ pub struct CarlaBackend {
     /// CARLA's view of the ego's collisions, logged beside SSv2's verdict and never fed
     /// into it (roadmap 014, gap 3). See `collision_monitor`.
     collision_monitor: CollisionMonitor,
-    /// CARLA's episode id for `world`, when it could be read. A reconnect that finds a
-    /// different one is talking to a restarted server (or a world someone else loaded): the
-    /// old actor ids mean nothing there and the old episode's clock has ended.
+    /// CARLA's episode id for `world`, when it could be read: the world protocol's
+    /// episode_id (roadmap 051). A reconnect that finds a different one is talking to a
+    /// restarted server (or a world someone else loaded): the old actor ids mean nothing
+    /// there, and every vehicle stack of the old episode ends.
     world_id: Option<u64>,
-    /// Where the episode clock is recorded for the next swb process (clock_store).
-    clock_path: PathBuf,
     /// Generator mode: write `<map dir>/traffic_lights.yaml` instead of checking it.
     generate_signal_table: bool,
     /// Map-frame position of CARLA's world origin for the scenario's map, read at every
     /// Initialize from `<map dir>/carla/map_origin.yaml` (zero without one).
     map_origin: MapOrigin,
-    /// Set after the first failed write, so a broken runtime dir warns once.
-    warned_clock_store: bool,
     /// Set when a CARLA call failed by timing out (`SLOW_FAILURE`): the server is gone or
     /// hung. Until a reconnect succeeds, teleports, despawns and teardown skip their RPCs
     /// rather than wait out the same timeout once per actor (roadmap 016, gap 10).
@@ -1271,9 +1225,7 @@ impl CarlaBackend {
         let collision_monitor_enabled = config.collision_monitor_enabled();
         let contact_report_dir = config.contact_report_dir();
         let world_id = world.id().ok();
-        let clock_path = crate::clock_store::path_for(&carla_host, carla_port);
         let agent_ledger = agent_link::ledger_path(&carla_host, carla_port);
-        let episode_clock = Self::resume_clock(&clock_path, world_id);
         // Validated by BridgeConfig::validate, so an unknown name cannot get this far.
         let requested_weather =
             crate::weather::preset(config.weather.trim()).map(|(name, w)| (name.to_string(), w));
@@ -1293,8 +1245,6 @@ impl CarlaBackend {
             carla_port,
             config_dir,
             signal_map: SignalMap::new(),
-            episode_clock,
-            epoch_marker_due: Some("start-up"),
             warned_unmapped_signals: HashSet::new(),
             warned_arrow_shapes: false,
             world,
@@ -1348,8 +1298,6 @@ impl CarlaBackend {
             idle_probe_failures: 0,
             collision_monitor,
             world_id,
-            clock_path,
-            warned_clock_store: false,
             generate_signal_table: false,
             map_origin: MapOrigin::default(),
             carla_unreachable: false,
@@ -1684,6 +1632,11 @@ impl CarlaBackend {
                 tracing::warn!("Time of day: {e:#}");
             }
         }
+    }
+
+    /// The world protocol's episode_id: CARLA's world id, 0 when it could not be read.
+    pub fn episode_id(&self) -> u64 {
+        self.world_id.unwrap_or(0)
     }
 
     /// The physics a vehicle stack's car runs: `carla_physics.yaml` (`vehicle_physics`), set
@@ -2356,7 +2309,9 @@ impl CarlaBackend {
             // restore it afterwards even on failure.
             let load_timeout = self.bound(budgets::LOAD_WORLD_RPC_TIMEOUT);
             self.set_client_timeout(load_timeout);
-            let prepared = self.reload_as_pause(&town, &current_town);
+            // A new episode: its time starts at BASE_NS again, and every vehicle stack of the
+            // old one ends (acb exits on the world id it sees change; roadmap 051).
+            let prepared = self.prepare_map(&town, &current_town);
             self.set_client_timeout(budgets::CLIENT_RPC_TIMEOUT);
             // CARLA stays synchronous across the load (reset_settings = false), and swb stays
             // its only ticker. Re-apply the settings to the new world anyway: the step and
@@ -2367,12 +2322,12 @@ impl CarlaBackend {
             self.world = world;
             self.last_tick_frame = None;
             self.forget_road_graph();
-            // The new episode's epoch, recorded before anything can kill this process: a
-            // restart would otherwise resume the old episode's (gap 11).
-            self.record_clock();
-            // And in the new world, for a vehicle side that starts after this reload.
-            self.epoch_marker_due = Some("map load");
-            self.write_epoch_marker();
+            tracing::info!(
+                "Episode change: {current_town} -> {town}, episode {:?}; time starts again at \
+                 {}",
+                self.world_id,
+                fmt_ns(sim_ns(0.0))
+            );
             if let Err(e) = self.enable_sync_mode() {
                 tracing::warn!("Could not re-apply synchronous mode to the new world: {e}");
             }
@@ -2407,88 +2362,17 @@ impl CarlaBackend {
         self.load_signal_map(&town, lanelet2_map_path)
     }
 
-    /// Reload the world as a pause in simulation time (roadmap 015).
-    ///
-    /// Sync mode goes on *before* the last snapshot is read, and nothing ticks between that
-    /// read and the reload. acb applies the same epoch rule from the last `on_tick` it
-    /// received; with CARLA synchronous, the frame read here is that frame, so both bridges
-    /// land on the same epoch with no channel between them. Read in async mode instead and
-    /// CARLA could tick once more before the load, putting acb one step ahead of swb.
-    fn reload_as_pause(&mut self, town: &str, current_town: &str) -> Result<carla::client::World> {
-        let mut backend = CarlaReload {
-            backend: self,
-            town,
-            current_town,
-            f0: None,
-        };
-        let out = reload_as_pause(&mut backend);
-        let f0 = backend.f0;
-        if let Some(e) = &out.sync_error {
-            tracing::warn!(
-                "Could not switch CARLA to synchronous mode before reloading ({e}); acb may \
-                 see a later last frame and its epoch may differ from swb's"
-            );
-        }
-        if let Some(e) = &out.read_error {
-            tracing::warn!("Could not read CARLA's last frame before reloading: {e}");
-        }
-        let world = out.world?;
-
-        // The snapshot swb read is not the old episode's last frame: CARLA's LoadEpisode
-        // ticked it again while waiting. Count the extra frames from the new world's first
-        // snapshot (see `old_episode_last_elapsed`), so the epoch lands where acb's does.
-        let counted = match (out.last_frame, f0, world.snapshot()) {
-            (Some((e0, d0)), Some(f0), Ok(after)) => {
-                let e1 = after.timestamp().elapsed_seconds;
-                let f1 = after.frame() as u64;
-                match old_episode_last_elapsed(e0, d0, f0, f1, e1) {
-                    Some(e_last) => {
-                        tracing::debug!(
-                            "Old episode's last frame counted: F0 {f0} E0 {e0:.9}, F1 {f1} E1 \
-                             {e1:.9} -> E_last {e_last:.9}"
-                        );
-                        Some((e_last, d0))
-                    }
-                    None => {
-                        tracing::warn!(
-                            "Could not count the old episode's frames (F0 {f0} E0 {e0:.9}, F1 {f1} \
-                             E1 {e1:.9}); the epoch uses the pre-reload snapshot and may trail \
-                             acb's by the frames CARLA ticked during the load"
-                        );
-                        Some((e0, d0))
-                    }
-                }
-            }
-            (last, _, _) => last,
-        };
-        let last = counted.or(self.episode_clock.last_frame());
-        let (e_last, d_last) = last.unwrap_or_else(|| {
-            tracing::warn!(
-                "No last frame known for the old episode; the new one starts at the current \
-                 epoch and simulation time may go back"
-            );
-            (0.0, 0.0)
-        });
-        let change = self.episode_clock.begin_episode(e_last, d_last);
-        tracing::info!(
-            "Episode change: epoch {} -> {}, sim_time continues at {} (town {current_town} -> {town})",
-            fmt_ns(change.old_epoch_ns),
-            fmt_ns(change.new_epoch_ns),
-            fmt_ns(change.continues_at_ns)
-        );
-        Ok(world)
-    }
-
     /// `(elapsed_seconds, delta_seconds)` of CARLA's current snapshot.
     fn read_frame(&self) -> Result<(f64, f64)> {
         read_frame_of(&self.world)
     }
 
     /// The simulation time to report to SSv2, in integer nanoseconds: CARLA's current frame
-    /// plus the epoch, or 0 (the protocol's "unknown") if the snapshot cannot be read.
+    /// plus BASE_NS (roadmap 051), or 0 (the protocol's "unknown") if the snapshot cannot
+    /// be read.
     fn current_simulation_time_ns(&mut self) -> i64 {
         match self.read_frame() {
-            Ok((elapsed, delta)) => self.episode_clock.observe(elapsed, delta),
+            Ok((elapsed, _)) => sim_ns(elapsed),
             Err(e) => {
                 tracing::warn!("Could not read CARLA's time; reporting 0: {e}");
                 0
@@ -3135,60 +3019,6 @@ impl CarlaBackend {
         result
     }
 
-    /// The clock a new swb starts with: the previous process's, if it left one.
-    fn resume_clock(path: &std::path::Path, world_id: Option<u64>) -> EpisodeClock {
-        use crate::clock_store::{load, resume, Resume};
-        let Some(stored) = load(path) else {
-            tracing::info!(
-                "Episode clock: none recorded at {}; epoch 0",
-                path.display()
-            );
-            return EpisodeClock::default();
-        };
-        match resume(stored, world_id) {
-            Resume::SameEpisode(clock) => {
-                tracing::info!(
-                    "Episode clock: resumed epoch {} from the previous swb (same CARLA episode)",
-                    fmt_ns(clock.epoch())
-                );
-                clock
-            }
-            Resume::NewEpisode(clock) => {
-                tracing::warn!(
-                    "Episode clock: CARLA is in another episode than the previous swb recorded \
-                     ({:?} -> {world_id:?}); epoch {} -> {}, sim_time continues at {}",
-                    stored.world_id,
-                    fmt_ns(stored.epoch_ns),
-                    fmt_ns(clock.epoch()),
-                    fmt_ns(clock.sim_ns(0.0))
-                );
-                clock
-            }
-        }
-    }
-
-    /// Record the episode clock for the next swb process. Cheap (tmpfs); called after every
-    /// change to it.
-    fn record_clock(&mut self) {
-        let Some(world_id) = self.world_id else {
-            return;
-        };
-        let stored = crate::clock_store::StoredClock {
-            world_id,
-            epoch_ns: self.episode_clock.epoch(),
-            last_frame: self.episode_clock.last_frame(),
-        };
-        if let Err(e) = crate::clock_store::save(&self.clock_path, &stored) {
-            if !std::mem::replace(&mut self.warned_clock_store, true) {
-                tracing::warn!(
-                    "Could not record the episode clock at {} ({e}); a restarted swb would \
-                     start from epoch 0",
-                    self.clock_path.display()
-                );
-            }
-        }
-    }
-
     /// Note how a failed CARLA call failed: one that took longer than `SLOW_FAILURE` timed
     /// out, and marks CARLA unreachable until the next reconnect.
     fn note_failure_after(&mut self, started: Instant) {
@@ -3203,13 +3033,12 @@ impl CarlaBackend {
     }
 
     /// After a reconnect to a different episode -- CARLA restarted -- drop what belonged to
-    /// the old server and end its episode on the clock.
+    /// the old server.
     ///
     /// Actor ids from the old server name nothing, or worse something else, on the new one,
     /// so the ledger is forgotten, not torn down: destroying by stale id could take a new
-    /// server's traffic light or another client's car. Time continues by the episode rule
-    /// applied to the last frame swb observed, anchored at the new episode's elapsed 0 --
-    /// the rule acb applies to the last frame it received (docs/design/time-and-ticking.md).
+    /// server's traffic light or another client's car. The new episode's time starts at
+    /// BASE_NS again (docs/design/time-and-ticking.md, roadmap 051).
     fn forget_previous_server(&mut self) {
         let forgotten = self.spawned_actors.len();
         self.spawned_actors.clear();
@@ -3231,173 +3060,12 @@ impl CarlaBackend {
         self.miss_watch.reset();
         self.stale_snapshots = 0;
 
-        match self.episode_clock.last_frame() {
-            Some((e_last, d_last)) => {
-                let change = self.episode_clock.begin_episode(e_last, d_last);
-                tracing::warn!(
-                    "CARLA was restarted (new episode {:?}): forgot {forgotten} actor(s) of the \
-                     old server; epoch {} -> {}, sim_time continues at {}",
-                    self.world_id,
-                    fmt_ns(change.old_epoch_ns),
-                    fmt_ns(change.new_epoch_ns),
-                    fmt_ns(change.continues_at_ns)
-                );
-            }
-            None => tracing::warn!(
-                "CARLA was restarted (new episode {:?}): forgot {forgotten} actor(s) of the old \
-                 server; no frame of the old one was ever read, so the epoch stays",
-                self.world_id
-            ),
-        }
-        self.record_clock();
-        // The new server's world carries no marker; a vehicle side started from here on
-        // reads it.
-        self.epoch_marker_due = Some("CARLA restart");
-        self.write_epoch_marker();
-    }
-
-    /// Leave exactly one epoch marker in the world, recording swb's epoch (`epoch_marker`),
-    /// if one is due. Stays due while swb cannot see the world's actors: the client's actor
-    /// list is only as new as the last frame it received, and a swb that has not ticked yet
-    /// (start-up, CARLA paused) has none -- it would spawn a duplicate, or miss a stale one.
-    fn write_epoch_marker(&mut self) {
-        let Some(why) = self.epoch_marker_due else {
-            return;
-        };
-        use crate::epoch_marker as em;
-        let epoch = self.episode_clock.epoch();
-        let seen_a_frame = self.world.snapshot().is_ok_and(|s| s.frame() != 0);
-        if !seen_a_frame {
-            return;
-        }
-        let markers: Vec<(u32, i64)> =
-            match self.world.actors().and_then(|a| a.filter(em::BLUEPRINT)) {
-                Ok(actors) => actors
-                    .iter()
-                    .filter_map(|actor| {
-                        let role = actor
-                            .attributes()
-                            .ok()?
-                            .iter()
-                            .find(|a| a.id() == "role_name")
-                            .map(|a| a.value_string())?;
-                        Some((actor.id(), em::parse(&role)?))
-                    })
-                    .collect(),
-                Err(e) => {
-                    tracing::warn!("Epoch marker ({why}): could not list the world's actors: {e}");
-                    return;
-                }
-            };
-        self.epoch_marker_due = None;
-        if epoch == 0 {
-            if let Some(&(id, recorded)) = markers.iter().max_by_key(|&&(id, _)| id) {
-                tracing::warn!(
-                    "Epoch marker ({why}): swb's epoch is 0 but the world records {} (actor \
-                     {id}); a vehicle side started now adopts that. swb probably lost its \
-                     clock record ({}); left in place",
-                    fmt_ns(recorded),
-                    self.clock_path.display()
-                );
-            }
-            return;
-        }
-        let plan = em::plan(epoch, &markers);
-        for &(id, recorded) in &plan.stale {
-            if recorded != epoch {
-                tracing::warn!(
-                    "Epoch marker ({why}): the world records {} (actor {id}), swb's epoch is \
-                     {}; replacing it",
-                    fmt_ns(recorded),
-                    fmt_ns(epoch)
-                );
-            }
-            let destroyed = self
-                .world
-                .actors()
-                .ok()
-                .and_then(|a| a.find(id).ok().flatten())
-                .map(|actor| actor.destroy());
-            if let Some(Err(e)) = destroyed {
-                tracing::warn!("Epoch marker ({why}): could not destroy actor {id}: {e}");
-            }
-        }
-        if !plan.spawn {
-            tracing::debug!(
-                "Epoch marker ({why}): the world already records {}",
-                fmt_ns(epoch)
-            );
-            return;
-        }
-        self.spawn_epoch_marker(why, epoch);
-    }
-
-    /// Spawn one marker recording `epoch` (nonzero), without looking at what the world holds.
-    fn spawn_epoch_marker(&mut self, why: &str, epoch: i64) {
-        use crate::epoch_marker as em;
-        let transform = Transform {
-            location: Location {
-                x: 0.0,
-                y: 0.0,
-                z: em::LOCATION_Z,
-            },
-            rotation: Rotation {
-                roll: 0.0,
-                pitch: 0.0,
-                yaw: 0.0,
-            },
-        };
-        let spawned = self
-            .world
-            .actor_builder(em::BLUEPRINT)
-            .and_then(|b| b.set_attribute("role_name", &em::role_name(epoch)))
-            .and_then(|b| b.spawn(transform));
-        match spawned {
-            // Not in `spawned_actors`: it belongs to the episode, not to a scenario, and
-            // teardown must leave it.
-            Ok(actor) => tracing::info!(
-                "Epoch marker ({why}): epoch {} recorded in the world (actor {})",
-                fmt_ns(epoch),
-                actor.id()
-            ),
-            Err(e) => tracing::warn!(
-                "Epoch marker ({why}): could not spawn {} ({e}); a vehicle side started in \
-                 this episode starts at epoch 0, {} behind",
-                em::BLUEPRINT,
-                fmt_ns(epoch)
-            ),
-        }
-    }
-
-    /// The start-up marker, written when swb connects rather than at the first scenario
-    /// tick, so that a vehicle side started before any scenario reads the right epoch.
-    ///
-    /// A world CARLA ticks by itself (asynchronous: the state swb leaves on shutdown) sends
-    /// a frame within one of its ticks; swb waits for it and writes the marker as after any
-    /// change. A paused synchronous world (a swb that did not shut down cleanly left it so)
-    /// sends none until swb ticks, and swb does not tick outside a scenario. There swb
-    /// spawns its marker without looking: acb reads the newest marker, so the new one
-    /// wins over a stale one, and the marker stays due, so the first tick removes the
-    /// stale ones and collapses duplicates.
-    pub fn write_epoch_marker_at_connect(&mut self) {
-        let Some(why) = self.epoch_marker_due else {
-            return;
-        };
-        let seen_a_frame = |w: &World| w.snapshot().is_ok_and(|s| s.frame() != 0);
-        if !seen_a_frame(&self.world) {
-            let asynchronous = self.world.settings().is_ok_and(|s| !s.synchronous_mode);
-            if asynchronous {
-                let _ = self.world.wait_for_tick_or_timeout(CONNECT_FRAME_WAIT);
-            }
-        }
-        if seen_a_frame(&self.world) {
-            self.write_epoch_marker();
-            return;
-        }
-        let epoch = self.episode_clock.epoch();
-        if epoch != 0 {
-            self.spawn_epoch_marker(&format!("{why}, before a frame"), epoch);
-        }
+        tracing::warn!(
+            "CARLA was restarted (new episode {:?}): forgot {forgotten} actor(s) of the old \
+             server; time starts again at {}, and every vehicle stack of the old episode ends",
+            self.world_id,
+            fmt_ns(sim_ns(0.0))
+        );
     }
 
     /// `Initialize`, under its deadline ([`budgets::INITIALIZE_BUDGET`], 034 step 3): every
@@ -3555,9 +3223,7 @@ impl CarlaBackend {
             req.step_time
         );
         // CARLA is paused here: this is the frame SSv2's first UpdateFrame steps from.
-        let simulation_time_ns = self.current_simulation_time_ns();
-        self.record_clock();
-        Ok(simulation_time_ns)
+        Ok(self.current_simulation_time_ns())
     }
 
     /// Hold a freshly spawned ego still until its bridge says localization is on it.
@@ -3701,31 +3367,25 @@ impl CarlaBackend {
         let substeps = self.substeps.max(1);
         let ssv2_frame = self.collision_monitor.frame();
         let mut substep = 0;
-        let frame = tick_then_read(
-            self,
-            substeps,
-            |c| {
-                substep += 1;
-                let started = Instant::now();
-                let step = format!("UpdateFrame {ssv2_frame}, tick {substep} of {substeps}");
-                let hang =
-                    substep == 1 && c.hang_hook.as_ref().is_some_and(|h| h.fires_at(ssv2_frame));
-                let result = if hang {
-                    c.watched_hang(&step)
-                } else {
-                    c.watched_tick(&step)
-                };
-                c.tick_time += started.elapsed();
-                result.map(|_| ())
-            },
-            |c| read_frame_of(&c.world),
-        );
-        let frame = frame?;
-        // A marker still due (start-up, or a paused world after a change) can be written
-        // now: swb sees the world's actors from its first tick on.
-        self.write_epoch_marker();
-        Ok(match frame {
-            Ok((elapsed, delta)) => self.episode_clock.observe(elapsed, delta),
+        // Every substep, then the frame after the last one: what SSv2 is told about.
+        let mut tick = |c: &mut Self| {
+            substep += 1;
+            let started = Instant::now();
+            let step = format!("UpdateFrame {ssv2_frame}, tick {substep} of {substeps}");
+            let hang = substep == 1 && c.hang_hook.as_ref().is_some_and(|h| h.fires_at(ssv2_frame));
+            let result = if hang {
+                c.watched_hang(&step)
+            } else {
+                c.watched_tick(&step)
+            };
+            c.tick_time += started.elapsed();
+            result.map(|_| ())
+        };
+        for _ in 0..substeps {
+            tick(self)?;
+        }
+        Ok(match read_frame_of(&self.world) {
+            Ok((elapsed, _)) => sim_ns(elapsed),
             Err(e) => {
                 tracing::warn!("Could not read CARLA's time after the frame; reporting 0: {e}");
                 0
@@ -3958,7 +3618,6 @@ impl CarlaBackend {
         };
 
         self.note_carla_ok();
-        self.record_clock();
         Ok(simulation_time_ns)
     }
 
@@ -6566,8 +6225,6 @@ impl SimBackend for CarlaBackend {
     fn before_serving(&mut self) {
         // The configured weather, now that there is a world to apply it to.
         self.reapply_weather("connect");
-        // The episode's epoch, for a vehicle side started before the first scenario.
-        self.write_epoch_marker_at_connect();
     }
 
     fn initialize(&mut self, episode: &Episode) -> Result<i64, BackendError> {

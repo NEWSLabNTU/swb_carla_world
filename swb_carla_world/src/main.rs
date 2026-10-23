@@ -20,8 +20,6 @@
 mod actor_census;
 mod backend;
 mod blueprint_boxes;
-mod clock_store;
-mod epoch_marker;
 mod sensor_release;
 mod spawn_ladder;
 mod tick_gate;
@@ -30,8 +28,8 @@ mod world;
 
 pub(crate) use swb_core::{
     agent_link, autopilot, body_clearance, budgets, config, contact_report, coordinate_conversion,
-    entity_manager, environment, episode_clock, gap_trace, lanelet_map, map_resolver, npc_tracking,
-    proto, ros_args, weather,
+    entity_manager, environment, gap_trace, lanelet_map, map_resolver, npc_tracking, proto,
+    ros_args, sim_time, weather,
 };
 
 use std::io::Write;
