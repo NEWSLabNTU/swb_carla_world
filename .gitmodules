@@ -1,8 +1,8 @@
 [submodule "deps/swb_world_protocol"]
 	path = deps/swb_world_protocol
 	url = https://github.com/NEWSLabNTU/swb_world_protocol.git
-	branch = target-shape
+	branch = main
 [submodule "deps/sim_vehicle_spec"]
 	path = deps/sim_vehicle_spec
 	url = https://github.com/NEWSLabNTU/sim_vehicle_spec.git
-	branch = target-shape
+	branch = main
