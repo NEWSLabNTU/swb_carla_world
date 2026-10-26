@@ -29,12 +29,13 @@ The CARLA version is the `carla-0916` feature of the `carla` dependency (`Cargo.
 
 ## The ego's physics
 
-A scenario's ego runs the car its vehicle spec describes (roadmap 051, K3): the server
-applies `carla_physics.yaml` (ROS parameter `vehicle_physics`, default the installed
-`sim_vehicle_spec/generated/tesla_model3/carla_physics.yaml`; `none` leaves the blueprint's)
-before the spawn's settling tick, reads it back after that tick and refuses an actor that
-differs. The spawn reply names the spec's `spec_hash`, which the bridge compares with the
-vehicle side's.
+A scenario's ego can run the car its vehicle spec describes (roadmap 051, K3). The server's
+ROS parameter `vehicle_physics` names a `carla_physics.yaml` (for the Tesla, the installed
+`sim_vehicle_spec/generated/tesla_model3/carla_physics.yaml`); the default, `none`, leaves
+the blueprint's own physics, so runs made before the specs drive the same cars. Given a
+file, the server applies it before the spawn's settling tick, reads it back after that tick
+and refuses an actor that differs. The spawn reply names the spec's `spec_hash`, which the
+bridge compares with the vehicle side's.
 
 ## Time and episodes
 

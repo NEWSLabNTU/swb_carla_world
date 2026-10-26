@@ -25,8 +25,8 @@
   <arg name="npc_contact_sensors" default=""
        description="true | false: a collision sensor on every tracked NPC vehicle, for the gap trace and oracle (roadmap 032); empty keeps the config file's (default true)"/>
 
-  <arg name="vehicle_physics" default="$(find-pkg-share sim_vehicle_spec)/generated/tesla_model3/carla_physics.yaml"
-       description="sim_vehicle_spec's carla_physics.yaml: the physics the ego and agent vehicles of its blueprint run (roadmap 051); none = the blueprints' own"/>
+  <arg name="vehicle_physics" default="none"
+       description="sim_vehicle_spec's carla_physics.yaml (share/sim_vehicle_spec/generated/tesla_model3/ for the Tesla): the physics the ego and agent vehicles of its blueprint run (roadmap 051); none (the default) = the blueprints' own"/>
 
   <node pkg="swb_carla_world" exec="swb_carla_world" name="swb_carla_world"
         output="screen" respawn="true" respawn_delay="2.0">
