@@ -5347,12 +5347,55 @@ impl CarlaBackend {
         }
     }
 
+    /// What CARLA's lights show now, by OpenDRIVE signal id (the world protocol's
+    /// `GetSignals`): read from each light, not from `commanded_lights`. Empty `ids`: every
+    /// light commanded so far.
+    pub fn signal_states(
+        &mut self,
+        ids: &[String],
+    ) -> std::result::Result<Vec<(String, carla::rpc::TrafficLightState)>, BackendError> {
+        let ids: Vec<String> = if ids.is_empty() {
+            let mut all: Vec<String> = self.commanded_lights.keys().cloned().collect();
+            all.sort();
+            all
+        } else {
+            ids.to_vec()
+        };
+        let mut states = Vec::new();
+        let mut failures = Vec::new();
+        for id in ids {
+            match self
+                .traffic_light(&id)
+                .and_then(|l| l.state().map_err(|e| eyre::eyre!("read '{id}': {e}")))
+            {
+                Ok(state) => states.push((id, state)),
+                Err(e) => failures.push(e.to_string()),
+            }
+        }
+        if failures.is_empty() {
+            Ok(states)
+        } else {
+            failed(format!(
+                "Failed to read {} traffic light state(s): {}",
+                failures.len(),
+                failures.join("; ")
+            ))
+        }
+    }
+
     /// Write one signal state to the CARLA light with the given OpenDRIVE sign ID.
     fn set_signal_state(
         &mut self,
         opendrive_id: &str,
         state: carla::rpc::TrafficLightState,
     ) -> Result<()> {
+        self.traffic_light(opendrive_id)?
+            .set_state(state)
+            .map_err(|e| eyre::eyre!("set state on '{opendrive_id}': {e}"))
+    }
+
+    /// The CARLA light with the given OpenDRIVE sign ID.
+    fn traffic_light(&self, opendrive_id: &str) -> Result<carla::client::TrafficLight> {
         let actor = self
             .world
             .traffic_light_from_open_drive(opendrive_id)
@@ -5361,16 +5404,12 @@ impl CarlaBackend {
                 eyre::eyre!("no CARLA traffic light with OpenDRIVE id '{opendrive_id}'")
             })?;
 
-        let light = match actor.into_kinds() {
-            carla::client::ActorKind::TrafficLight(light) => light,
+        match actor.into_kinds() {
+            carla::client::ActorKind::TrafficLight(light) => Ok(light),
             _ => {
                 eyre::bail!("CARLA actor for OpenDRIVE id '{opendrive_id}' is not a traffic light")
             }
-        };
-
-        light
-            .set_state(state)
-            .map_err(|e| eyre::eyre!("set state on '{opendrive_id}': {e}"))
+        }
     }
 
     /// Restore async mode so CARLA isn't stuck waiting for ticks on exit.

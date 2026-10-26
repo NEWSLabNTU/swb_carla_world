@@ -241,6 +241,16 @@ fn subtype_of(s: &str) -> EntitySubtype {
     EntitySubtype::from_str_name(&s.to_ascii_uppercase()).unwrap_or(EntitySubtype::Unknown)
 }
 
+fn state_colour(s: &::carla::rpc::TrafficLightState) -> wire::Colour {
+    use ::carla::rpc::TrafficLightState as S;
+    match s {
+        S::Red => wire::Colour::Red,
+        S::Yellow => wire::Colour::Amber,
+        S::Green => wire::Colour::Green,
+        _ => wire::Colour::Off,
+    }
+}
+
 fn colour_state(c: i32) -> ::carla::rpc::TrafficLightState {
     use ::carla::rpc::TrafficLightState as S;
     match wire::Colour::try_from(c).unwrap_or(wire::Colour::Off) {
@@ -615,6 +625,21 @@ impl World for CarlaWorld {
         let backend = self.backend()?;
         let result = backend.set_signal_states(&states);
         result.map_err(|e| refusal(e, backend))
+    }
+
+    fn get_signals(&mut self, req: &wire::GetSignals) -> WorldResult<wire::SignalsReply> {
+        let backend = self.backend()?;
+        let result = backend.signal_states(&req.opendrive_ids);
+        let states = result.map_err(|e| refusal(e, backend))?;
+        Ok(wire::SignalsReply {
+            states: states
+                .iter()
+                .map(|(id, s)| wire::SignalState {
+                    opendrive_id: id.clone(),
+                    colour: state_colour(s) as i32,
+                })
+                .collect(),
+        })
     }
 
     fn set_goal(&mut self, req: &wire::SetGoal) -> WorldResult<()> {
