@@ -1,5 +1,5 @@
-//! The tick gate: swb waits, before each `world.tick()`, until a follower that asked for it
-//! has finished the frame swb ticked last.
+//! The tick gate: swb waits, before each `world.tick()`, until every follower that asked for
+//! it has finished the frame swb ticked last.
 //!
 //! swb is the only process that ticks CARLA (docs/design/time-and-ticking.md). A process
 //! that follows swb's frames instead of ticking (2026-vehicle-consensus' junction harness)
@@ -7,20 +7,25 @@
 //! frame. With the gate the follower still never ticks, but swb holds the next tick until the
 //! follower says it is done with the current frame, so the follower sees every frame.
 //!
+//! Several followers can join at once (the harness, and ns-3 emulating the network in
+//! lockstep with the world): each is known by the address its datagrams come from, and a
+//! tick waits for all of them.
+//!
 //! Protocol, UDP datagrams to the gate's address (`SWB_TICK_GATE`, or `tick_gate` in
 //! `bridge_config.yaml`):
 //!
-//! - `HELLO` -- a follower joins: from now on every tick waits for it;
+//! - `HELLO` -- a follower joins: from now on every tick waits for it (a `DONE` joins too);
 //! - `DONE <frame>` -- the follower finished CARLA frame `<frame>`;
 //! - `BYE` -- the follower leaves: ticks no longer wait.
 //!
 //! The wait is bounded (`tick_gate_timeout_ms`): a follower that does not answer in time does
-//! not stop the simulation, the tick goes ahead and the miss is counted. A follower silent
+//! not stop the simulation, the tick goes ahead and the miss is counted, per follower. A follower silent
 //! for [`SILENT_LEAVES`] is taken as gone, so a crashed follower costs at most a few
 //! bounded waits. The wait runs in swb's request path before the tick, never inside a tick
 //! or a sensor callback.
 
-use std::net::UdpSocket;
+use std::collections::BTreeMap;
+use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 /// A follower silent this long has left (its process died without a `BYE`).
@@ -88,12 +93,20 @@ impl GateState {
     }
 }
 
-/// The gate's socket and state.
+/// One follower: its state and what the gate spent on it.
+#[derive(Debug, Clone, Default)]
+pub struct Follower {
+    pub state: GateState,
+    /// Ticks that went ahead because this follower did not finish in time.
+    pub missed: u64,
+}
+
+/// The gate's socket and its followers, by the address their datagrams come from.
 pub struct TickGate {
     sock: UdpSocket,
-    state: GateState,
+    followers: BTreeMap<SocketAddr, Follower>,
     timeout: Duration,
-    /// Ticks that went ahead because the follower did not finish in time.
+    /// Ticks that went ahead because a follower did not finish in time.
     pub missed: u64,
     /// Ticks that waited, and how long in all.
     pub waits: u64,
@@ -107,7 +120,7 @@ impl TickGate {
         sock.set_nonblocking(true)?;
         Ok(Self {
             sock,
-            state: GateState::default(),
+            followers: BTreeMap::new(),
             timeout,
             missed: 0,
             waits: 0,
@@ -115,55 +128,74 @@ impl TickGate {
         })
     }
 
+    /// The followers known so far, by address.
+    pub fn followers(&self) -> &BTreeMap<SocketAddr, Follower> {
+        &self.followers
+    }
+
+    fn apply(&mut self, from: SocketAddr, msg: GateMsg, now: Instant) {
+        let f = self.followers.entry(from).or_default();
+        if msg != GateMsg::Bye && !f.state.active {
+            tracing::info!("tick gate: follower {from} joined; every tick waits for it");
+        }
+        if msg == GateMsg::Bye && f.state.active {
+            tracing::info!(
+                "tick gate: follower {from} left ({} tick(s) went ahead of it)",
+                f.missed
+            );
+        }
+        f.state.apply(msg, now);
+    }
+
     fn drain(&mut self) {
         let mut buf = [0u8; 256];
-        while let Ok(n) = self.sock.recv(&mut buf) {
+        while let Ok((n, from)) = self.sock.recv_from(&mut buf) {
             if let Some(m) = GateMsg::parse(&String::from_utf8_lossy(&buf[..n])) {
-                if m == GateMsg::Hello && !self.state.active {
-                    tracing::info!("tick gate: a follower joined; every tick waits for it");
-                }
-                if m == GateMsg::Bye && self.state.active {
-                    tracing::info!(
-                        "tick gate: the follower left ({} waits, {:.1} s waited, {} missed)",
-                        self.waits,
-                        self.waited.as_secs_f64(),
-                        self.missed
-                    );
-                }
-                self.state.apply(m, Instant::now());
+                self.apply(from, m, Instant::now());
             }
         }
     }
 
-    /// Before the tick that follows `frame` (the frame swb ticked last): wait until the
+    /// Whether any follower holds the tick after `frame`.
+    fn holds(&self, frame: u64, now: Instant) -> bool {
+        self.followers.values().any(|f| f.state.holds(frame, now))
+    }
+
+    /// Before the tick that follows `frame` (the frame swb ticked last): wait until every
     /// follower finished it, at most the gate's timeout.
     pub fn wait_for(&mut self, frame: u64) {
         self.drain();
         let start = Instant::now();
-        if !self.state.holds(frame, start) {
+        if !self.holds(frame, start) {
             return;
         }
         self.waits += 1;
         // Blocking reads with a short timeout, so a datagram ends the wait at once.
         let _ = self.sock.set_nonblocking(false);
         let _ = self.sock.set_read_timeout(Some(Duration::from_millis(2)));
-        while self.state.holds(frame, Instant::now()) {
+        while self.holds(frame, Instant::now()) {
             if start.elapsed() >= self.timeout {
                 self.missed += 1;
-                if self.missed.is_power_of_two() {
-                    tracing::warn!(
-                        "tick gate: the follower did not finish frame {frame} within {} ms; \
-                         ticking on ({} miss(es) so far)",
-                        self.timeout.as_millis(),
-                        self.missed
-                    );
+                let now = Instant::now();
+                for (addr, f) in self.followers.iter_mut() {
+                    if f.state.holds(frame, now) {
+                        f.missed += 1;
+                        if f.missed.is_power_of_two() {
+                            tracing::warn!(
+                                "tick gate: follower {addr} did not finish frame {frame} within \
+                                 {} ms; ticking on ({} miss(es) so far)",
+                                self.timeout.as_millis(),
+                                f.missed
+                            );
+                        }
+                    }
                 }
                 break;
             }
             let mut buf = [0u8; 256];
-            if let Ok(n) = self.sock.recv(&mut buf) {
+            if let Ok((n, from)) = self.sock.recv_from(&mut buf) {
                 if let Some(m) = GateMsg::parse(&String::from_utf8_lossy(&buf[..n])) {
-                    self.state.apply(m, Instant::now());
+                    self.apply(from, m, Instant::now());
                 }
             }
         }
@@ -236,6 +268,45 @@ mod tests {
         assert_eq!(g.missed, 0);
         // Nothing for frame 8: the wait ends at the timeout and is counted.
         g.wait_for(8);
+        assert_eq!(g.missed, 1);
+    }
+
+    #[test]
+    fn a_tick_waits_for_every_follower() {
+        let mut g = TickGate::bind("127.0.0.1:0", Duration::from_millis(500)).unwrap();
+        let addr = g.sock.local_addr().unwrap();
+        let fast = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let slow = UdpSocket::bind("127.0.0.1:0").unwrap();
+        fast.send_to(b"HELLO", addr).unwrap();
+        slow.send_to(b"HELLO", addr).unwrap();
+        fast.send_to(b"DONE 5", addr).unwrap();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            slow.send_to(b"DONE 5", addr).unwrap();
+            slow
+        });
+        let start = Instant::now();
+        g.wait_for(5);
+        let took = start.elapsed();
+        let slow = t.join().unwrap();
+        assert!(
+            took >= Duration::from_millis(70) && took < Duration::from_millis(400),
+            "the tick waited for the slower follower: {took:?}"
+        );
+        assert_eq!(g.followers().len(), 2);
+        // Only the slow follower is behind on frame 6: the miss is counted against it.
+        fast.send_to(b"DONE 6", addr).unwrap();
+        g.wait_for(6);
+        assert_eq!(g.missed, 1);
+        let behind = g.followers()[&slow.local_addr().unwrap()].missed;
+        let ahead = g.followers()[&fast.local_addr().unwrap()].missed;
+        assert_eq!((behind, ahead), (1, 0));
+        // One leaves: the other alone decides.
+        slow.send_to(b"BYE", addr).unwrap();
+        fast.send_to(b"DONE 7", addr).unwrap();
+        let start = Instant::now();
+        g.wait_for(7);
+        assert!(start.elapsed() < Duration::from_millis(100));
         assert_eq!(g.missed, 1);
     }
 }

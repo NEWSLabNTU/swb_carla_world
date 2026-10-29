@@ -2275,11 +2275,14 @@ impl CarlaBackend {
         self.shut_down_traffic_manager("bridge shutdown");
         if let Some(g) = &self.tick_gate {
             tracing::info!(
-                "tick gate: {} wait(s), {:.1} s waited, {} tick(s) went ahead of the follower",
+                "tick gate: {} wait(s), {:.1} s waited, {} tick(s) went ahead of a follower",
                 g.waits,
                 g.waited.as_secs_f64(),
                 g.missed
             );
+            for (addr, f) in g.followers() {
+                tracing::info!("tick gate: follower {addr}: {} tick(s) went ahead of it", f.missed);
+            }
         }
     }
 
