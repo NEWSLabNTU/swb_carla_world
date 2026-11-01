@@ -22,6 +22,7 @@ mod backend;
 mod blueprint_boxes;
 mod sensor_release;
 mod spawn_ladder;
+mod spectator;
 mod tick_gate;
 mod tick_watchdog;
 mod world;
@@ -74,6 +75,8 @@ fn main() -> Result<()> {
     let mut config = config::BridgeConfig::load_for(&config_file, config::ConfigOwner::CarlaWorld)?;
     config.apply_env_overrides();
     config.apply_ros_params(&params)?;
+    // The spectator's keys are this server's alone (roadmap 068 step 2).
+    let spectator = spectator::Config::load(&config_file)?;
     // The weather preset is CARLA's to name (roadmap 051): an unknown one stops the start.
     if !config.weather.trim().is_empty() {
         backend::carla::weather::preset_or_err(config.weather.trim())
@@ -146,6 +149,7 @@ fn main() -> Result<()> {
     };
     let mut world =
         world::CarlaWorld::new(config, config_dir).with_vehicle_physics(vehicle_physics);
+    world.set_spectator(spectator);
     world.try_connect();
     let mut shell = Shell::new(world);
     let end = world_server::serve(&socket, &mut shell, &shutdown, budgets::IDLE_PROBE_AFTER)?;

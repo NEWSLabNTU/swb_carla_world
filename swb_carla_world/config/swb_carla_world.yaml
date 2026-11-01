@@ -144,3 +144,19 @@ traffic_manager:
   port: 8000
   seed: 2017
   serve: false
+
+# CARLA's spectator (roadmap 068 step 2): the camera of CARLA's window, or of the editor
+# attached to it. `follow` puts it straight down over the target after every step, `once` on
+# the first step after each target spawns, `off` (the default) never touches it, so a
+# headless run does nothing new. The target is the ego; with no ego, the first vehicle
+# spawned, then the first entity; a despawned target hands the camera to the next.
+#
+# Grabbing the camera takes it: before each placement the server compares the spectator with
+# where it put it last, and more than 0.1 m or 1 deg apart means a person moved it -- the
+# server logs that once and leaves it alone until the next LoadWorld. Costs one get_transform
+# (a local read) and one set_transform (an RPC) per step, counted in the bridge's frame stats
+# as the step's processing time; each world's count and mean/max cost are logged at the next
+# LoadWorld.
+spectator: off
+# Metres above the target.
+spectator_height: 50

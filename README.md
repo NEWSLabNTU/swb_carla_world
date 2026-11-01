@@ -67,3 +67,11 @@ ros2 service call /scenario_world_bridge/set_weather swb_interfaces/srv/SetWeath
 The server keeps the weather asked for -- `weather:` in `swb_carla_world.yaml` (checked at
 start), then the last `SetWeather` -- and applies it again after every world load and
 reconnect.
+
+## Spectator
+
+`spectator: follow | once | off` and `spectator_height` (m, default 50) in
+`swb_carla_world.yaml` move CARLA's spectator straight down over the ego -- with no ego, the
+first vehicle spawned, then the first entity -- after every step (`follow`) or once per
+target (`once`); `off`, the default, leaves it alone. A camera someone moved (more than 0.1 m
+or 1 deg from where the server put it) stays theirs until the next `LoadWorld`.

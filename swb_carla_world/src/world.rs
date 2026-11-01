@@ -28,6 +28,7 @@ use crate::proto::geometry_msgs::{self, Pose};
 use crate::proto::swb_world as wire;
 use crate::proto::traffic_simulator_msgs::entity_subtype::Enum as EntitySubtype;
 use crate::proto::traffic_simulator_msgs::{ActionStatus, BoundingBox};
+use crate::spectator::{self, Decision, Role, Spectator};
 use crate::weather::wire_form;
 use swb_core::world_server::{Refusal, World, WorldResult};
 
@@ -48,6 +49,8 @@ pub struct CarlaWorld {
     map_origin: [f64; 3],
     /// The vehicle spec's physics, for every backend this server connects (roadmap 051 K3).
     vehicle_physics: Option<carla_physics_spec::CarlaPhysics>,
+    /// CARLA's spectator, moved over the ego after each step when asked (roadmap 068 step 2).
+    spectator: Spectator,
 }
 
 #[derive(Debug, Clone)]
@@ -84,7 +87,21 @@ impl CarlaWorld {
             handles: BTreeMap::new(),
             map_origin: [0.0; 3],
             vehicle_physics: None,
+            spectator: Spectator::new(spectator::Config::default()),
         }
+    }
+
+    /// The spectator's keys (`spectator`, `spectator_height`).
+    pub fn set_spectator(&mut self, config: spectator::Config) {
+        if config.spectator != spectator::Mode::Off {
+            tracing::info!(
+                "Spectator: {:?}, {} m above the ego (else the first vehicle, else the first \
+                 entity)",
+                config.spectator,
+                config.spectator_height
+            );
+        }
+        self.spectator = Spectator::new(config);
     }
 
     /// The vehicle spec's physics the ego and agent vehicles get (`vehicle_physics`).
@@ -197,6 +214,46 @@ impl CarlaWorld {
                 w: q.w,
             }),
             rpy: None,
+        }
+    }
+
+    /// After a step: put the spectator over its target if a placement is due, unless a person
+    /// moved it since the last one. A failure is logged once per world and never fails the
+    /// step.
+    fn place_spectator(&mut self) {
+        let Some(target) = self.spectator.due().map(str::to_string) else {
+            return;
+        };
+        let Some(backend) = self.backend.as_mut() else {
+            return;
+        };
+        let started = Instant::now();
+        let views = backend.spectator_and_target(&target);
+        let result = views.and_then(|(current, target_view)| {
+            match self.spectator.decide(&current, &target_view) {
+                Decision::Place(view) => backend.set_spectator(&view).map(|()| Some(view)),
+                Decision::HandOver {
+                    moved_by,
+                    turned_by,
+                } => {
+                    tracing::info!(
+                        "Spectator: moved by someone else ({moved_by:.2} m, {turned_by:.1} deg \
+                         from where it was set); leaving it there until the next LoadWorld"
+                    );
+                    Ok(None)
+                }
+            }
+        });
+        match result {
+            Ok(Some(view)) => self.spectator.placed(&target, view, started.elapsed()),
+            Ok(None) => {}
+            Err(e) => {
+                if self.spectator.failed() {
+                    tracing::warn!(
+                        "Spectator not placed over '{target}': {e} (said once per world)"
+                    );
+                }
+            }
         }
     }
 
@@ -324,6 +381,9 @@ impl World for CarlaWorld {
         }
         self.entities.clear();
         self.handles.clear();
+        if let Some(summary) = self.spectator.new_world() {
+            tracing::info!("{summary}");
+        }
         Ok(wire::LoadWorldReply {
             sim_time_ns: ns,
             episode_id,
@@ -402,6 +462,14 @@ impl World for CarlaWorld {
             },
         );
         self.handles.insert(req.name.clone(), handle);
+        self.spectator.spawned(
+            &req.name,
+            match kind {
+                wire::Kind::Ego => Role::Ego,
+                wire::Kind::Vehicle => Role::Vehicle,
+                _ => Role::Other,
+            },
+        );
         Ok(match body {
             Some(b) => wire::Body {
                 sim_id: b.actor_id,
@@ -432,6 +500,7 @@ impl World for CarlaWorld {
         result.map_err(|e| refusal(e, backend))?;
         self.entities.remove(&handle);
         self.handles.remove(&name);
+        self.spectator.despawned(&name);
         Ok(())
     }
 
@@ -598,6 +667,9 @@ impl World for CarlaWorld {
                 })
             })
             .collect();
+        // After the states, so it reuses their snapshot. Its time is not `tick_seconds`: the
+        // bridge's frame stats count it as this request's processing time.
+        self.place_spectator();
         let contacts = self.contacts();
         Ok(wire::StepReply {
             sim_time: ns as f64 / 1e9,
@@ -713,6 +785,9 @@ impl World for CarlaWorld {
         }
         self.entities.clear();
         self.handles.clear();
+        if let Some(summary) = self.spectator.new_world() {
+            tracing::info!("{summary}");
+        }
         Ok(())
     }
 

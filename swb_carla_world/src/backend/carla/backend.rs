@@ -457,6 +457,7 @@ use crate::proto::traffic_simulator_msgs::{self, BoundingBox};
 use crate::sensor_release::SensorReleaseNotifier;
 use crate::sim_time::{fmt_ns, sim_ns};
 use crate::spawn_ladder;
+use crate::spectator::View;
 use crate::weather::{WeatherReply, WeatherRequest};
 use swb_core::environment::{self, TimeOfDay};
 
@@ -1187,6 +1188,21 @@ pub struct CarlaBackend {
     /// The snapshot [`CarlaBackend::actor_states`] read after the last tick, for the next
     /// [`CarlaBackend::fresh_snapshot`] of the same tick.
     post_tick_snapshot: Option<carla::client::WorldSnapshot>,
+    /// CARLA's spectator in `world`, fetched on first use (roadmap 068 step 2) and dropped
+    /// whenever `world` is replaced.
+    spectator: Option<carla::client::Actor>,
+}
+
+/// A CARLA transform as the spectator's plain numbers (CARLA's frame, degrees).
+fn view_of(t: &Transform) -> View {
+    View {
+        x: t.location.x as f64,
+        y: t.location.y as f64,
+        z: t.location.z as f64,
+        pitch: t.rotation.pitch as f64,
+        yaw: t.rotation.yaw as f64,
+        roll: t.rotation.roll as f64,
+    }
 }
 
 /// What a spawn chose for an entity: the gap trace `entity` record's CARLA half.
@@ -1351,6 +1367,7 @@ impl CarlaBackend {
             gap_trace,
             last_spawn_body: None,
             post_tick_snapshot: None,
+            spectator: None,
         }
     }
 
@@ -1436,6 +1453,53 @@ impl CarlaBackend {
             .collect();
         self.post_tick_snapshot = Some(snapshot);
         states
+    }
+
+    /// The spectator's transform and `target`'s, for the world server's spectator (roadmap 068
+    /// step 2). The spectator's is its `get_transform`, the target's comes from the post-tick
+    /// snapshot shared with [`CarlaBackend::actor_states`]; both read LibCarla's copy of the
+    /// last tick, so neither is an RPC (only a world's first `world.spectator()` is).
+    pub fn spectator_and_target(
+        &mut self,
+        target: &str,
+    ) -> std::result::Result<(View, View), String> {
+        if self.wedged.is_some() || self.carla_unreachable {
+            return Err("CARLA is not answering".into());
+        }
+        let id = self
+            .entities
+            .get(target)
+            .map(|e| e.carla_actor_id)
+            .ok_or_else(|| format!("no actor for '{target}'"))?;
+        let snapshot = self.fresh_snapshot().map_err(|e| format!("{e:#}"))?;
+        let target_view = snapshot.find(id).map(|a| view_of(&a.transform()));
+        self.post_tick_snapshot = Some(snapshot);
+        let target_view =
+            target_view.ok_or_else(|| format!("'{target}' is not in the snapshot"))?;
+        if self.spectator.is_none() {
+            self.spectator = Some(
+                self.world
+                    .spectator()
+                    .map_err(|e| format!("spectator: {e}"))?,
+            );
+        }
+        let spectator = self.spectator.as_ref().expect("fetched above");
+        let current = spectator
+            .transform()
+            .map_err(|e| format!("spectator get_transform: {e}"))?;
+        Ok((view_of(&current), target_view))
+    }
+
+    /// Put the spectator at `view` (its `set_transform`, one RPC).
+    pub fn set_spectator(&mut self, view: &View) -> std::result::Result<(), String> {
+        let spectator = self.spectator.as_ref().ok_or("no spectator yet")?;
+        let transform = Transform {
+            location: Location::new(view.x as f32, view.y as f32, view.z as f32),
+            rotation: Rotation::new(view.pitch as f32, view.yaw as f32, view.roll as f32),
+        };
+        spectator
+            .set_transform(&transform)
+            .map_err(|e| format!("spectator set_transform: {e}"))
     }
 
     /// The CARLA frame of the last tick, when there was one in this world.
@@ -2281,7 +2345,10 @@ impl CarlaBackend {
                 g.missed
             );
             for (addr, f) in g.followers() {
-                tracing::info!("tick gate: follower {addr}: {} tick(s) went ahead of it", f.missed);
+                tracing::info!(
+                    "tick gate: follower {addr}: {} tick(s) went ahead of it",
+                    f.missed
+                );
             }
         }
     }
@@ -2354,6 +2421,7 @@ impl CarlaBackend {
             self.world_id = world.id().ok();
             self.world = world;
             self.last_tick_frame = None;
+            self.spectator = None;
             self.forget_road_graph();
             tracing::info!(
                 "Episode change: {current_town} -> {town}, episode {:?}; time starts again at \
@@ -2988,6 +3056,7 @@ impl CarlaBackend {
         self.world = world;
         self.world_id = world_id;
         self.last_tick_frame = None;
+        self.spectator = None;
         self.consecutive_carla_failures = 0;
         self.carla_unreachable = false;
         self.forget_road_graph();
